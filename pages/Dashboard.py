@@ -1,2311 +1,1517 @@
 """
-E-COMMERCE ANALYTICS DASHBOARD
-Built with Streamlit
+E-COMMERCE DATA AGGREGATION SCRIPT
+===================================
 
-HOW TO RUN:
-streamlit run dashboard.py
+PURPOSE:
+This script reads raw e-commerce tracking data (CSV files) and creates
+aggregated summary tables for fast dashboard loading.
 
-PREREQUISITES:
-pip install streamlit pandas plotly numpy
+WHAT IT DOES:
+1. Loads 8 raw CSV files (user, session, order, etc.)
+2. Performs calculations and aggregations
+3. Creates 7 aggregated summary tables
+4. Exports results as CSV files
+
+WHY WE NEED THIS:
+- Dashboards load 10-100x faster by reading pre-calculated summaries
+- Consistent metrics across all dashboards
+- Reduces database load
+
+WHEN TO RUN:
+- Daily at 1 AM (automated via cron job or task scheduler)
+- After any raw data updates
+- When adding new calculated fields
+
+HOW TO MODIFY:
+- See DATABASE_DESIGN_DOCUMENTATION.md for detailed instructions
+- Each function has comments explaining what can be changed
+
+BUSINESS RULES:
+- HOLIDAY10 coupon = 10% discount on total_price
+- RING20 coupon     = 20% discount on total_price
+- No coupon         = 0% discount
+- total_price       = sum of (product_price x product_qty), BEFORE discount, EXCLUDING shipping
+- product_price     = unit price only, never pre-multiplied by qty
+
+PRODUCTS & UNIT PRICES:
+- Video Doorbell Pro 2    = $249.99
+- Ring Alarm 8-piece      = $249.99
+- Indoor Cam (2nd Gen)    = $59.99
+- Stick Up Cam Battery    = $99.99
+
+AUTHOR: Data Engineering Team
+LAST UPDATED: 2026-02-17
 """
 
-import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, timedelta
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# PAGE CONFIGURATION
+# CONFIGURATION SECTION
 # ==============================================================================
 
-st.set_page_config(
-    page_title="E-Commerce Analytics Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS for better styling
-st.markdown("""
-    <style>
-    .main-header {
-        font-size: 36px;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        padding: 20px 0;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
-    }
-    .kpi-label {
-        font-size: 14px;
-        color: #666;
-        font-weight: 500;
-    }
-    .kpi-value {
-        font-size: 32px;
-        font-weight: bold;
-        color: #1f77b4;
-    }
-    .positive-change {
-        color: #00cc00;
-        font-weight: bold;
-    }
-    .negative-change {
-        color: #ff3333;
-        font-weight: bold;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# ==============================================================================
-# DATA LOADING FUNCTIONS
-# ==============================================================================
-
-@st.cache_data
-def load_data():
+class Config:
     """
-    Loads all aggregated CSV files with error handling
-    
-    Returns:
-        dict: Dictionary containing all DataFrames
+    Configuration settings for the data processing pipeline
+    MODIFY THESE PATHS based on your folder structure
     """
-    data = {}
-    
-    try:
-        # Load all aggregated tables
-        data['daily_metrics'] = pd.read_csv('aggregated_data/daily_business_metrics.csv')
-        data['daily_metrics']['date'] = pd.to_datetime(data['daily_metrics']['date'])
-        
-        data['session_attribution'] = pd.read_csv('aggregated_data/session_attribution.csv')
-        data['session_attribution']['date'] = pd.to_datetime(data['session_attribution']['date'])
-        
-        data['session_funnel'] = pd.read_csv('aggregated_data/session_funnel.csv')
-        data['session_funnel']['date'] = pd.to_datetime(data['session_funnel']['date'])
-        
-        data['product_performance'] = pd.read_csv('aggregated_data/product_performance_daily.csv')
-        data['product_performance']['date'] = pd.to_datetime(data['product_performance']['date'])
-        
-        data['user_lifetime'] = pd.read_csv('aggregated_data/user_lifetime_metrics.csv')
-        data['user_lifetime']['first_order_date'] = pd.to_datetime(data['user_lifetime']['first_order_date'])
-        data['user_lifetime']['last_order_date'] = pd.to_datetime(data['user_lifetime']['last_order_date'])
-        
-        data['page_engagement'] = pd.read_csv('aggregated_data/page_engagement_metrics.csv')
-        data['page_engagement']['date'] = pd.to_datetime(data['page_engagement']['date'])
-        
-        data['coupon_performance'] = pd.read_csv('aggregated_data/coupon_performance.csv')
-        data['coupon_performance']['date'] = pd.to_datetime(data['coupon_performance']['date'])
-        
-        return data
-    
-    except FileNotFoundError as e:
-        st.error(f"❌ Data file not found: {e}")
-        st.info("Please ensure aggregated data files are in 'aggregated_data/' folder")
-        return None
-    except Exception as e:
-        st.error(f"❌ Error loading data: {e}")
-        return None
+    # Input folder - where raw CSV files are stored
+    RAW_DATA_DIR = 'raw_data/'
+
+    # Output folder - where aggregated CSV files will be saved
+    AGGREGATED_DATA_DIR = 'aggregated_data/'
+
+    # Log folder - where processing logs are saved
+    LOG_DIR = 'logs/'
+
+    # Date range to process
+    # None = process all data
+    # Set specific date to process only that day: datetime(2025, 1, 1)
+    START_DATE = None
+    END_DATE = None
+
+    # COUPON RULES
+    # Maps coupon code → discount percentage (as decimal)
+    # HOLIDAY10 = 10%, RING20 = 20%, no coupon = 0%
+    COUPON_DISCOUNT_MAP = {
+        'HOLIDAY10': 0.10,
+        'RING20':    0.20,
+    }
+
+    # PRODUCT UNIT PRICES
+    # Used to validate product_price values loaded from CSVs
+    PRODUCT_PRICES = {
+        'Video Doorbell Pro 2':   249.99,
+        'Ring Alarm 8-piece':     249.99,
+        'Indoor Cam (2nd Gen)':   59.99,
+        'Stick Up Cam Battery':   99.99,
+    }
+
+    @staticmethod
+    def setup_directories():
+        """Creates necessary folders if they don't exist"""
+        for directory in [Config.RAW_DATA_DIR,
+                          Config.AGGREGATED_DATA_DIR,
+                          Config.LOG_DIR]:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+                print(f"Created directory: {directory}")
+
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 
-def format_number(num, decimals=0, prefix='', suffix=''):
-    """Format numbers with K, M, B suffixes"""
-    if pd.isna(num):
-        return "N/A"
-    
-    if abs(num) >= 1_000_000_000:
-        formatted = f"{num/1_000_000_000:.{decimals}f}B"
-    elif abs(num) >= 1_000_000:
-        formatted = f"{num/1_000_000:.{decimals}f}M"
-    elif abs(num) >= 1_000:
-        formatted = f"{num/1_000:.{decimals}f}K"
-    else:
-        formatted = f"{num:.{decimals}f}"
-    
-    return f"{prefix}{formatted}{suffix}"
+def log_message(message, log_file='aggregation_log.txt'):
+    """
+    Writes messages to both console and log file
 
-def calculate_change(current, previous):
-    """Calculate percentage change"""
-    if previous == 0:
-        return 0
-    return ((current - previous) / previous) * 100
+    WHY: Track when script runs and if errors occur
 
-def create_metric_card(label, value, change=None, prefix='', suffix=''):
-    """Create styled metric card"""
-    formatted_value = format_number(value, decimals=2, prefix=prefix, suffix=suffix)
-    
-    if change is not None:
-        change_class = 'positive-change' if change > 0 else 'negative-change'
-        change_symbol = '▲' if change > 0 else '▼'
-        return f"""
-        <div class="metric-card">
-            <div class="kpi-label">{label}</div>
-            <div class="kpi-value">{formatted_value}</div>
-            <div class="{change_class}">{change_symbol} {abs(change):.1f}% vs prev period</div>
-        </div>
-        """
-    else:
-        return f"""
-        <div class="metric-card">
-            <div class="kpi-label">{label}</div>
-            <div class="kpi-value">{formatted_value}</div>
-        </div>
-        """
+    Args:
+        message (str): Message to log
+        log_file (str): Name of log file
+    """
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
 
-# ==============================================================================
-# SIDEBAR FILTERS
-# ==============================================================================
+    if not os.path.exists(Config.LOG_DIR):
+        os.makedirs(Config.LOG_DIR)
 
-def render_sidebar(data):
-    """Render sidebar with global filters"""
-    st.sidebar.title("🎛️ Filters")
-    
-    # Date range filter
-    st.sidebar.subheader("📅 Date Range")
-    
-    # Get min and max dates from daily metrics
-    min_date = data['daily_metrics']['date'].min().date()
-    max_date = data['daily_metrics']['date'].max().date()
-    
-    # Default to last 30 days
-    default_start = max_date - timedelta(days=30)
-    
-    date_range = st.sidebar.date_input(
-        "Select date range",
-        value=(default_start, max_date),
-        min_value=min_date,
-        max_value=max_date
+    log_path = os.path.join(Config.LOG_DIR, log_file)
+    with open(log_path, 'a') as f:
+        f.write(log_entry + '\n')
+
+
+def load_csv_safe(filename, required_columns=None):
+    """
+    Safely loads a CSV file with error handling
+
+    WHY: Prevents script from crashing if file is missing or corrupted
+
+    Args:
+        filename (str): Name of CSV file to load
+        required_columns (list): Columns that must exist
+
+    Returns:
+        DataFrame or None if file not found
+    """
+    filepath = os.path.join(Config.RAW_DATA_DIR, filename)
+
+    try:
+        df = pd.read_csv(filepath)
+        log_message(f"✓ Loaded {filename}: {len(df)} rows")
+
+        if required_columns:
+            missing = set(required_columns) - set(df.columns)
+            if missing:
+                log_message(f"⚠ Warning: {filename} missing columns: {missing}")
+
+        return df
+
+    except FileNotFoundError:
+        log_message(f"✗ Error: {filename} not found in {Config.RAW_DATA_DIR}")
+        return None
+
+    except Exception as e:
+        log_message(f"✗ Error loading {filename}: {str(e)}")
+        return None
+
+
+def parse_dates(df, date_columns):
+    """
+    Converts string dates to datetime format
+
+    Args:
+        df (DataFrame): DataFrame to process
+        date_columns (list): Column names containing dates
+
+    Returns:
+        DataFrame with parsed dates
+    """
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    return df
+
+
+def validate_and_fix_discounts(orders_df):
+    """
+    Validates and corrects the discount field in orders based on coupon rules.
+
+    BUSINESS RULES:
+    - HOLIDAY10 → discount = total_price * 10%
+    - RING20     → discount = total_price * 20%
+    - No coupon  → discount = 0
+
+    WHY THIS MATTERS:
+    - total_price = gross product amount (before discount, no shipping)
+    - The discount field must exactly match the coupon rule
+    - Any mismatch is corrected and flagged in the log
+
+    HOW IT WORKS:
+    1. Calculate what the discount SHOULD be based on coupon code
+    2. Compare to what the discount IS in the data
+    3. If they differ → overwrite with correct value and log a warning
+
+    Args:
+        orders_df (DataFrame): Order data with columns:
+            - discount_coupon_code: coupon code or NaN if none
+            - total_price: gross order amount before discount
+            - discount: discount amount to validate
+
+    Returns:
+        DataFrame: orders_df with corrected discount column
+    """
+    log_message("  Validating coupon discount amounts...")
+
+    # Fill missing coupon codes with 'NO_COUPON' for clarity
+    orders_df['discount_coupon_code'] = orders_df['discount_coupon_code'].fillna('NO_COUPON')
+
+    # Calculate what discount SHOULD be for each row based on coupon code
+    # Logic: look up coupon in COUPON_DISCOUNT_MAP, multiply by total_price
+    # If coupon not in map (or NO_COUPON) → expected discount = 0
+    orders_df['expected_discount'] = orders_df.apply(
+        lambda row: round(
+            row['total_price'] * Config.COUPON_DISCOUNT_MAP.get(row['discount_coupon_code'], 0.0),
+            2
+        ),
+        axis=1
     )
-    
-    if len(date_range) == 2:
-        start_date, end_date = date_range
+
+    # Find rows where actual discount does not match expected discount
+    # WHY: Mismatches indicate bad data that would corrupt coupon performance metrics
+    mismatch_mask = (orders_df['discount'].round(2) != orders_df['expected_discount'])
+    mismatch_count = mismatch_mask.sum()
+
+    if mismatch_count > 0:
+        log_message(f"  ⚠ Found {mismatch_count} order(s) with incorrect discount amounts — correcting...")
+
+        # Log a sample of mismatches for audit trail
+        sample = orders_df[mismatch_mask][['order_id', 'discount_coupon_code',
+                                           'total_price', 'discount',
+                                           'expected_discount']].head(5)
+        for _, row in sample.iterrows():
+            log_message(
+                f"    Order {row['order_id']}: coupon={row['discount_coupon_code']}, "
+                f"total={row['total_price']}, "
+                f"discount was {row['discount']} → corrected to {row['expected_discount']}"
+            )
+
+        # Overwrite incorrect discount values with correct ones
+        orders_df.loc[mismatch_mask, 'discount'] = orders_df.loc[mismatch_mask, 'expected_discount']
     else:
-        start_date = end_date = date_range[0]
-    
-    # Quick date filters
-    st.sidebar.markdown("**Quick Filters:**")
-    col1, col2 = st.sidebar.columns(2)
-    
-    if col1.button("Last 7 Days"):
-        start_date = max_date - timedelta(days=7)
-        end_date = max_date
-    
-    if col2.button("Last 30 Days"):
-        start_date = max_date - timedelta(days=30)
-        end_date = max_date
-    
-    if col1.button("Last 90 Days"):
-        start_date = max_date - timedelta(days=90)
-        end_date = max_date
-    
-    if col2.button("All Time"):
-        start_date = min_date
-        end_date = max_date
-    
-    st.sidebar.markdown("---")
-    
-    # Additional filters
-    st.sidebar.subheader("🔍 Additional Filters")
-    
-    # Product filter (for product-specific pages)
-    products = sorted(data['product_performance']['product_name'].unique())
-    selected_products = st.sidebar.multiselect(
-        "Filter by Products",
-        options=products,
-        default=None,
-        help="Leave empty to show all products"
+        log_message("  ✓ All discount amounts are correct")
+
+    # Drop helper column — not needed in output
+    orders_df = orders_df.drop(columns=['expected_discount'])
+
+    return orders_df
+
+
+def validate_product_prices(order_items_df):
+    """
+    Validates that product_price in order_line_item_table matches known unit prices.
+
+    BUSINESS RULES:
+    - product_price is always the UNIT price for a single item
+    - It must NOT be pre-multiplied by product_qty
+    - Known prices: Video Doorbell Pro 2 / Ring Alarm 8-piece = $249.99,
+                    Indoor Cam (2nd Gen) = $59.99, Stick Up Cam Battery = $99.99
+
+    WHY THIS MATTERS:
+    - line_revenue = product_price x product_qty
+    - If product_price is already multiplied, revenue calculations are wrong
+
+    HOW IT WORKS:
+    1. For each known product, check if product_price matches expected unit price
+    2. If not → log a warning (we do not auto-correct prices as they may reflect
+       legitimate promotions not captured in Config.PRODUCT_PRICES)
+
+    Args:
+        order_items_df (DataFrame): Order line items with columns:
+            - product_name, product_price, product_qty
+
+    Returns:
+        DataFrame: order_items_df unchanged (warnings logged only)
+    """
+    log_message("  Validating product unit prices...")
+
+    issues_found = 0
+
+    for product_name, expected_price in Config.PRODUCT_PRICES.items():
+        # Filter rows for this product
+        product_rows = order_items_df[order_items_df['product_name'] == product_name]
+
+        if product_rows.empty:
+            continue
+
+        # Find rows where price doesn't match expected unit price
+        # WHY round to 2dp: avoid floating point comparison issues
+        wrong_price_mask = (product_rows['product_price'].round(2) != round(expected_price, 2))
+        wrong_count = wrong_price_mask.sum()
+
+        if wrong_count > 0:
+            issues_found += wrong_count
+            log_message(
+                f"  ⚠ '{product_name}': {wrong_count} row(s) have unexpected price "
+                f"(expected ${expected_price}). Check if product_price has been pre-multiplied by qty."
+            )
+
+            # Show sample of bad rows
+            bad_sample = product_rows[wrong_price_mask][
+                ['order_id', 'product_name', 'product_price', 'product_qty']
+            ].head(3)
+            for _, row in bad_sample.iterrows():
+                log_message(
+                    f"    Order {row['order_id']}: price={row['product_price']}, qty={row['product_qty']}"
+                )
+
+    if issues_found == 0:
+        log_message("  ✓ All product prices match expected unit prices")
+
+    return order_items_df
+
+
+# ==============================================================================
+# DATA LOADING FUNCTIONS
+# ==============================================================================
+
+def load_all_raw_data():
+    """
+    Loads all 8 raw CSV files into memory
+
+    TABLE SCHEMAS (confirmed):
+    - user_table:           user_id, has_purchase_last_year, has_purchase_last_qtr
+    - session_table:        user_id, session_id, time, platform, device_type, country,
+                            region, city, IP, referrer, landing_page, landing_page_query,
+                            landing_page_hash, browser, utm_source, utm_medium, utm_campaign
+    - order_table:          event_id, user_id, session_id, order_id, time, total_price,
+                            shipping_price, discount, discount_coupon_code, total_items, total_qty
+    - add_to_cart_table:    event_id, user_id, session_id, time, domain, path, hash, query,
+                            previous_page, product_name, product_price, product_qty
+    - scroll_table:         event_id, user_id, session_id, time, scroll_percent, domain,
+                            path, hash, query, previous_page
+    - click_table:          event_id, user_id, session_id, time, domain, path, hash, query,
+                            href, target_id, target_tag, target_text, previous_page
+    - pageview_table:       event_id, user_id, session_id, time, domain, path, hash,
+                            query, previous_page
+    - order_line_item_table: event_id, user_id, session_id, order_id, time,
+                             product_name, product_price, product_qty
+
+    Returns:
+        dict: Dictionary with DataFrames for each table
+    """
+    log_message("="*60)
+    log_message("STARTING DATA LOAD")
+    log_message("="*60)
+
+    data = {}
+
+    # 1. USER TABLE
+    log_message("\n1. Loading user_table.csv...")
+    data['users'] = load_csv_safe(
+        'user_table.csv',
+        required_columns=['user_id', 'has_purchase_last_year', 'has_purchase_last_qtr']
     )
-    
-    # UTM Source filter (for marketing pages)
-    if 'utm_source' in data['session_attribution'].columns:
-        sources = sorted(data['session_attribution']['utm_source'].dropna().unique())
-        selected_sources = st.sidebar.multiselect(
-            "Filter by Traffic Source",
-            options=sources,
-            default=None,
-            help="Leave empty to show all sources"
+
+    # 2. SESSION TABLE
+    log_message("\n2. Loading session_table.csv...")
+    data['sessions'] = load_csv_safe(
+        'session_table.csv',
+        required_columns=['user_id', 'session_id', 'time', 'platform', 'device_type',
+                          'country', 'utm_source', 'utm_medium', 'utm_campaign']
+    )
+    if data['sessions'] is not None:
+        data['sessions'] = parse_dates(data['sessions'], ['time'])
+
+    # 3. ORDER TABLE
+    log_message("\n3. Loading order_table.csv...")
+    data['orders'] = load_csv_safe(
+        'order_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'order_id', 'time',
+                          'total_price', 'shipping_price', 'discount',
+                          'discount_coupon_code', 'total_items', 'total_qty']
+    )
+    if data['orders'] is not None:
+        data['orders'] = parse_dates(data['orders'], ['time'])
+        # VALIDATE coupon discount amounts against business rules
+        data['orders'] = validate_and_fix_discounts(data['orders'])
+
+    # 4. ORDER LINE ITEM TABLE
+    log_message("\n4. Loading order_line_item_table.csv...")
+    data['order_items'] = load_csv_safe(
+        'order_line_item_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'order_id',
+                          'time', 'product_name', 'product_price', 'product_qty']
+    )
+    if data['order_items'] is not None:
+        data['order_items'] = parse_dates(data['order_items'], ['time'])
+        # VALIDATE product unit prices against known prices
+        data['order_items'] = validate_product_prices(data['order_items'])
+
+    # 5. ADD TO CART TABLE
+    log_message("\n5. Loading add_to_cart_table.csv...")
+    data['cart'] = load_csv_safe(
+        'add_to_cart_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'time', 'domain',
+                          'path', 'product_name', 'product_price', 'product_qty']
+    )
+    if data['cart'] is not None:
+        data['cart'] = parse_dates(data['cart'], ['time'])
+
+    # 6. PAGEVIEW TABLE
+    log_message("\n6. Loading pageview_table.csv...")
+    data['pageviews'] = load_csv_safe(
+        'pageview_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'time',
+                          'domain', 'path', 'previous_page']
+    )
+    if data['pageviews'] is not None:
+        data['pageviews'] = parse_dates(data['pageviews'], ['time'])
+
+    # 7. SCROLL TABLE
+    log_message("\n7. Loading scroll_table.csv...")
+    data['scrolls'] = load_csv_safe(
+        'scroll_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'time',
+                          'scroll_percent', 'domain', 'path']
+    )
+    if data['scrolls'] is not None:
+        data['scrolls'] = parse_dates(data['scrolls'], ['time'])
+
+    # 8. CLICK TABLE
+    log_message("\n8. Loading click_table.csv...")
+    data['clicks'] = load_csv_safe(
+        'click_table.csv',
+        required_columns=['event_id', 'user_id', 'session_id', 'time', 'domain',
+                          'path', 'href', 'target_id', 'target_tag', 'target_text']
+    )
+    if data['clicks'] is not None:
+        data['clicks'] = parse_dates(data['clicks'], ['time'])
+
+    log_message("\n" + "="*60)
+    log_message("DATA LOAD COMPLETE")
+    log_message("="*60)
+
+    return data
+
+
+# ==============================================================================
+# AGGREGATION FUNCTION 1: DAILY BUSINESS METRICS
+# ==============================================================================
+
+def create_daily_business_metrics(orders_df, sessions_df, users_df):
+    """
+    Creates high-level daily KPIs for executive dashboard
+
+    PURPOSE:
+    - Provides daily snapshot of business health
+    - Fast loading for executive dashboard
+    - Historical trend analysis
+
+    CALCULATES:
+    - Total revenue per day (gross, before discount)
+    - Total discount given per day
+    - Net revenue per day (total_price - discount)
+    - Number of orders per day
+    - Number of sessions (website visits) per day
+    - Conversion rate (% of sessions that become orders)
+    - Average order value
+    - New vs repeat customers
+
+    HOW TO ADD NEW FIELD:
+    Example - Add "Total Shipping Revenue":
+    1. Add: metrics['total_shipping'] = orders_df.groupby('date')['shipping_price'].sum()
+    2. Add 'total_shipping' to the DataFrame creation at the end
+
+    Args:
+        orders_df (DataFrame): Order data
+        sessions_df (DataFrame): Session data
+        users_df (DataFrame): User data
+
+    Returns:
+        DataFrame: Daily aggregated metrics
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: daily_business_metrics")
+    log_message("="*60)
+
+    if orders_df is None or sessions_df is None:
+        log_message("⚠ Skipping - missing required data")
+        return None
+
+    orders_df['date'] = orders_df['time'].dt.date
+    sessions_df['date'] = sessions_df['time'].dt.date
+
+    metrics = {}
+
+    # 1. GROSS REVENUE PER DAY
+    # WHY: total_price = product amounts before discount, no shipping
+    log_message("  Calculating gross revenue...")
+    metrics['gross_revenue'] = orders_df.groupby('date')['total_price'].sum()
+
+    # 2. TOTAL DISCOUNT GIVEN PER DAY
+    # WHY: Tracks cost of coupon promotions per day
+    # discount is validated at load time against HOLIDAY10/RING20 rules
+    log_message("  Calculating total discounts...")
+    metrics['total_discount'] = orders_df.groupby('date')['discount'].sum()
+
+    # 3. NET REVENUE PER DAY
+    # WHY: Actual revenue after coupon discounts (still excludes shipping)
+    # FORMULA: gross_revenue - total_discount
+    log_message("  Calculating net revenue...")
+    metrics['net_revenue'] = metrics['gross_revenue'] - metrics['total_discount']
+
+    # 4. TOTAL ORDERS PER DAY
+    log_message("  Calculating total orders...")
+    metrics['total_orders'] = orders_df.groupby('date')['order_id'].nunique()
+
+    # 5. TOTAL SESSIONS PER DAY
+    log_message("  Calculating total sessions...")
+    metrics['total_sessions'] = sessions_df.groupby('date')['session_id'].nunique()
+
+    # 6. TOTAL UNIQUE USERS PER DAY
+    log_message("  Calculating total users...")
+    metrics['total_users'] = sessions_df.groupby('date')['user_id'].nunique()
+
+    # 7. CONVERSION RATE
+    # FORMULA: (orders / sessions) * 100
+    log_message("  Calculating conversion rate...")
+    metrics['conversion_rate'] = (
+        metrics['total_orders'] / metrics['total_sessions'] * 100
+    ).fillna(0)
+
+    # 8. AVERAGE ORDER VALUE (AOV) — based on gross revenue
+    # FORMULA: gross_revenue / total_orders
+    log_message("  Calculating average order value...")
+    metrics['avg_order_value'] = (
+        metrics['gross_revenue'] / metrics['total_orders']
+    ).fillna(0)
+
+    # 9. NEW VS REPEAT CUSTOMERS
+    # WHY: has_purchase_last_year flag from user_table
+    #      0 = new customer, 1 = repeat customer
+    if users_df is not None and 'has_purchase_last_year' in users_df.columns:
+        log_message("  Calculating new vs repeat customers...")
+
+        orders_with_user = orders_df.merge(
+            users_df[['user_id', 'has_purchase_last_year']],
+            on='user_id',
+            how='left'
         )
+
+        metrics['new_customers'] = orders_with_user[
+            orders_with_user['has_purchase_last_year'] == 0
+        ].groupby('date')['user_id'].nunique()
+
+        metrics['repeat_customers'] = orders_with_user[
+            orders_with_user['has_purchase_last_year'] == 1
+        ].groupby('date')['user_id'].nunique()
+
+    log_message("  Combining metrics...")
+    result_df = pd.DataFrame(metrics).reset_index()
+    result_df.columns.name = None
+
+    # Round monetary values
+    for col in ['gross_revenue', 'total_discount', 'net_revenue', 'avg_order_value']:
+        if col in result_df.columns:
+            result_df[col] = result_df[col].round(2)
+
+    result_df['conversion_rate'] = result_df['conversion_rate'].round(2)
+
+    log_message(f"✓ Created {len(result_df)} daily records")
+    log_message(f"  Date range: {result_df['date'].min()} to {result_df['date'].max()}")
+    log_message(f"  Total gross revenue: ${result_df['gross_revenue'].sum():,.2f}")
+    log_message(f"  Total discount given: ${result_df['total_discount'].sum():,.2f}")
+    log_message(f"  Total net revenue:    ${result_df['net_revenue'].sum():,.2f}")
+
+    return result_df
+
+
+# ==============================================================================
+# AGGREGATION FUNCTION 2: SESSION ATTRIBUTION
+# ==============================================================================
+
+def create_session_attribution(sessions_df, orders_df):
+    """
+    Links each session to its marketing source and conversion outcome
+
+    PURPOSE:
+    - Marketing attribution (which campaigns drive sales)
+    - ROI calculation for ad spend
+    - Channel performance comparison
+
+    SESSION TABLE FIELDS USED:
+    user_id, session_id, time, platform, device_type, country, region, city,
+    IP, referrer, landing_page, landing_page_query, landing_page_hash,
+    browser, utm_source, utm_medium, utm_campaign
+
+    HOW IT WORKS:
+    1. Take all sessions
+    2. LEFT JOIN with orders on session_id
+    3. converted=1 if order exists, else 0
+    4. revenue = total_price (gross, before discount) if converted, else 0
+
+    Args:
+        sessions_df (DataFrame): Session data
+        orders_df (DataFrame): Order data
+
+    Returns:
+        DataFrame: Session-level attribution data
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: session_attribution")
+    log_message("="*60)
+
+    if sessions_df is None:
+        log_message("⚠ Skipping - missing session data")
+        return None
+
+    log_message("  Merging sessions with orders...")
+
+    # LEFT JOIN: keep all sessions, attach order data where it exists
+    if orders_df is not None:
+        order_cols = orders_df[['session_id', 'order_id', 'total_price',
+                                'discount', 'discount_coupon_code', 'time']].copy()
     else:
-        selected_sources = None
-    
-    st.sidebar.markdown("---")
-    st.sidebar.info(f"📊 Data range: {min_date} to {max_date}")
-    
-    return {
-        'start_date': pd.Timestamp(start_date),
-        'end_date': pd.Timestamp(end_date),
-        'products': selected_products if selected_products else None,
-        'sources': selected_sources if selected_sources else None
-    }
+        order_cols = pd.DataFrame()
 
-# ==============================================================================
-# PAGE 1: EXECUTIVE SUMMARY
-# ==============================================================================
-
-def page_executive_summary(data, filters):
-    """Executive Summary Dashboard"""
-    
-    st.markdown('<div class="main-header">📊 Executive Summary</div>', unsafe_allow_html=True)
-    st.markdown("### High-level business metrics at a glance")
-    
-    # Filter data by date range
-    df = data['daily_metrics'][
-        (data['daily_metrics']['date'] >= filters['start_date']) &
-        (data['daily_metrics']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if df.empty:
-        st.warning("No data available for selected date range")
-        return
-    
-    # Calculate current period metrics
-    total_revenue = df['total_revenue'].sum()
-    total_orders = df['total_orders'].sum()
-    total_sessions = df['total_sessions'].sum()
-    avg_conversion_rate = (total_orders / total_sessions * 100) if total_sessions > 0 else 0
-    avg_order_value = total_revenue / total_orders if total_orders > 0 else 0
-    
-    # Calculate previous period for comparison
-    period_days = (filters['end_date'] - filters['start_date']).days
-    prev_start = filters['start_date'] - timedelta(days=period_days)
-    prev_end = filters['start_date'] - timedelta(days=1)
-    
-    df_prev = data['daily_metrics'][
-        (data['daily_metrics']['date'] >= prev_start) &
-        (data['daily_metrics']['date'] <= prev_end)
-    ]
-    
-    if not df_prev.empty:
-        prev_revenue = df_prev['total_revenue'].sum()
-        prev_orders = df_prev['total_orders'].sum()
-        prev_sessions = df_prev['total_sessions'].sum()
-        prev_conversion = (prev_orders / prev_sessions * 100) if prev_sessions > 0 else 0
-        prev_aov = prev_revenue / prev_orders if prev_orders > 0 else 0
-        
-        revenue_change = calculate_change(total_revenue, prev_revenue)
-        orders_change = calculate_change(total_orders, prev_orders)
-        conversion_change = calculate_change(avg_conversion_rate, prev_conversion)
-        aov_change = calculate_change(avg_order_value, prev_aov)
-    else:
-        revenue_change = orders_change = conversion_change = aov_change = None
-    
-    # TOP METRICS ROW
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            label="💰 Total Revenue",
-            value=f"${total_revenue:,.0f}",
-            delta=f"{revenue_change:+.1f}%" if revenue_change else None,
-            delta_color="normal"
-        )
-    
-    with col2:
-        st.metric(
-            label="🛍️ Total Orders",
-            value=f"{total_orders:,}",
-            delta=f"{orders_change:+.1f}%" if orders_change else None,
-            delta_color="normal"
-        )
-    
-    with col3:
-        st.metric(
-            label="📈 Conversion Rate",
-            value=f"{avg_conversion_rate:.2f}%",
-            delta=f"{conversion_change:+.1f}%" if conversion_change else None,
-            delta_color="normal"
-        )
-    
-    with col4:
-        st.metric(
-            label="💵 Avg Order Value",
-            value=f"${avg_order_value:.2f}",
-            delta=f"{aov_change:+.1f}%" if aov_change else None,
-            delta_color="normal"
-        )
-    
-    st.markdown("---")
-    
-    # REVENUE TREND CHART
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("📈 Daily Revenue Trend")
-        
-        fig = px.line(
-            df,
-            x='date',
-            y='total_revenue',
-            title='Revenue Over Time',
-            labels={'total_revenue': 'Revenue ($)', 'date': 'Date'}
-        )
-        
-        fig.update_traces(line_color='#1f77b4', line_width=2)
-        fig.update_layout(
-            hovermode='x unified',
-            plot_bgcolor='white',
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("👥 New vs Repeat Customers")
-        
-        if 'new_customers' in df.columns and 'repeat_customers' in df.columns:
-            new_customers = df['new_customers'].sum()
-            repeat_customers = df['repeat_customers'].sum()
-            
-            fig = go.Figure(data=[go.Pie(
-                labels=['New Customers', 'Repeat Customers'],
-                values=[new_customers, repeat_customers],
-                hole=0.4,
-                marker_colors=['#ff7f0e', '#2ca02c']
-            )])
-            
-            fig.update_layout(
-                title='Customer Type Distribution',
-                height=400,
-                showlegend=True
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Stats below pie chart
-            st.markdown(f"""
-            **Total Customers**: {new_customers + repeat_customers:,}
-            - 🆕 New: {new_customers:,} ({new_customers/(new_customers+repeat_customers)*100:.1f}%)
-            - 🔄 Repeat: {repeat_customers:,} ({repeat_customers/(new_customers+repeat_customers)*100:.1f}%)
-            """)
-        else:
-            st.info("New/Repeat customer data not available")
-    
-    # CONVERSION & AOV TRENDS
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Conversion Rate Trend")
-        
-        fig = px.line(
-            df,
-            x='date',
-            y='conversion_rate',
-            title='Conversion Rate Over Time',
-            labels={'conversion_rate': 'Conversion Rate (%)', 'date': 'Date'}
-        )
-        
-        # Add benchmark line at 3%
-        fig.add_hline(
-            y=3.0,
-            line_dash="dash",
-            line_color="red",
-            annotation_text="Industry Avg (3%)",
-            annotation_position="right"
-        )
-        
-        fig.update_traces(line_color='#2ca02c', line_width=2)
-        fig.update_layout(height=350, plot_bgcolor='white')
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("💳 Average Order Value Trend")
-        
-        fig = px.line(
-            df,
-            x='date',
-            y='avg_order_value',
-            title='AOV Over Time',
-            labels={'avg_order_value': 'AOV ($)', 'date': 'Date'}
-        )
-        
-        fig.update_traces(line_color='#d62728', line_width=2)
-        fig.update_layout(height=350, plot_bgcolor='white')
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # KEY INSIGHTS
-    st.markdown("---")
-    st.subheader("💡 Key Insights")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Best performing day
-        best_day = df.loc[df['total_revenue'].idxmax()]
-        st.info(f"""
-        **🏆 Best Revenue Day**  
-        {best_day['date'].strftime('%Y-%m-%d')}  
-        Revenue: ${best_day['total_revenue']:,.0f}
-        """)
-    
-    with col2:
-        # Average daily revenue
-        avg_daily_revenue = df['total_revenue'].mean()
-        st.info(f"""
-        **📊 Avg Daily Revenue**  
-        ${avg_daily_revenue:,.0f}  
-        Based on {len(df)} days
-        """)
-    
-    with col3:
-        # Total sessions
-        st.info(f"""
-        **👁️ Total Sessions**  
-        {total_sessions:,}  
-        Avg: {total_sessions/len(df):,.0f}/day
-        """)
-
-# ==============================================================================
-# PAGE 2: CONVERSION FUNNEL
-# ==============================================================================
-
-def page_conversion_funnel(data, filters):
-    """Conversion Funnel Analysis"""
-    
-    st.markdown('<div class="main-header">🔄 Conversion Funnel Analysis</div>', unsafe_allow_html=True)
-    st.markdown("### Track user journey from visit to purchase")
-    
-    # Filter data
-    df = data['session_funnel'][
-        (data['session_funnel']['date'] >= filters['start_date']) &
-        (data['session_funnel']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if df.empty:
-        st.warning("No funnel data available for selected date range")
-        return
-    
-    # Calculate funnel metrics
-    total_sessions = len(df)
-    product_views = df['had_product_view'].sum()
-    cart_adds = df['had_add_to_cart'].sum()
-    purchases = df['had_order'].sum()
-    
-    # Calculate conversion rates
-    product_view_rate = (product_views / total_sessions * 100) if total_sessions > 0 else 0
-    cart_rate = (cart_adds / total_sessions * 100) if total_sessions > 0 else 0
-    purchase_rate = (purchases / total_sessions * 100) if total_sessions > 0 else 0
-    cart_to_purchase_rate = (purchases / cart_adds * 100) if cart_adds > 0 else 0
-
-    # Calculate drop-off percentages
-    drop_off_1 = 100 - product_view_rate
-    drop_off_2 = product_view_rate - cart_rate
-    drop_off_3 = cart_rate - purchase_rate
-
-    
-    # FUNNEL VISUALIZATION
-    st.markdown("---")
-    st.subheader("📊 Funnel Overview")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # Create funnel chart
-        funnel_data = pd.DataFrame({
-            'Stage': ['Sessions', 'Product Views', 'Add to Cart', 'Purchase'],
-            'Count': [total_sessions, product_views, cart_adds, purchases],
-            'Percentage': [100, product_view_rate, cart_rate, purchase_rate]
-        })
-        
-        fig = go.Figure(go.Funnel(
-            y=funnel_data['Stage'],
-            x=funnel_data['Count'],
-            textposition="inside",
-            textinfo="value+percent initial",
-            marker=dict(
-                color=['#3498db', '#2ecc71', '#f39c12', '#e74c3c']
-            )
-        ))
-        
-        fig.update_layout(
-            title='Conversion Funnel',
-            height=500
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("### 📈 Funnel Metrics")
-        
-        st.metric(
-            "Sessions",
-            f"{total_sessions:,}",
-            "100%"
-        )
-        
-    
-    # TIME METRICS
-    st.markdown("---")
-    st.subheader("⏱️ Time Metrics")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Average time to cart
-        avg_time_to_cart = df[df['time_to_cart_minutes'].notna()]['time_to_cart_minutes'].mean()
-        
-        st.markdown(f"""
-        **⏰ Average Time to Add to Cart**  
-        `{avg_time_to_cart:.1f}` minutes
-        
-        *How long users take from landing on site to adding first item to cart*
-        """)
-        
-        # Distribution
-        fig = px.histogram(
-            df[df['time_to_cart_minutes'].notna()],
-            x='time_to_cart_minutes',
-            nbins=30,
-            title='Distribution of Time to Cart',
-            labels={'time_to_cart_minutes': 'Minutes', 'count': 'Sessions'}
-        )
-        
-        fig.update_layout(height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Average time to purchase
-        avg_time_to_purchase = df[df['time_to_order_minutes'].notna()]['time_to_order_minutes'].mean()
-        
-        st.markdown(f"""
-        **⏰ Average Time to Purchase**  
-        `{avg_time_to_purchase:.1f}` minutes
-        
-        *How long users take from landing on site to completing purchase*
-        """)
-        
-        # Distribution
-        fig = px.histogram(
-            df[df['time_to_order_minutes'].notna()],
-            x='time_to_order_minutes',
-            nbins=30,
-            title='Distribution of Time to Purchase',
-            labels={'time_to_order_minutes': 'Minutes', 'count': 'Sessions'}
-        )
-        
-        fig.update_layout(height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # FUNNEL BY DEVICE TYPE
-    st.markdown("---")
-    st.subheader("📱 Funnel by Device Type")
-    
-    # Join with session attribution to get device type
-    df_with_device = df.merge(
-        data['session_attribution'][['session_id', 'device_type']],
+    merged = sessions_df.merge(
+        order_cols,
         on='session_id',
-        how='left'
+        how='left',
+        suffixes=('_session', '_order')
     )
-    
-    if 'device_type' in df_with_device.columns:
-        device_funnel = df_with_device.groupby('device_type').agg({
-            'session_id': 'count',
-            'had_product_view': 'sum',
-            'had_add_to_cart': 'sum',
-            'had_order': 'sum'
-        }).reset_index()
-        
-        device_funnel.columns = ['Device', 'Sessions', 'Product Views', 'Cart Adds', 'Purchases']
-        
-        # Calculate rates
-        device_funnel['Product View Rate'] = (device_funnel['Product Views'] / device_funnel['Sessions'] * 100).round(2)
-        device_funnel['Cart Rate'] = (device_funnel['Cart Adds'] / device_funnel['Sessions'] * 100).round(2)
-        device_funnel['Conversion Rate'] = (device_funnel['Purchases'] / device_funnel['Sessions'] * 100).round(2)
-        
-        # Bar chart comparing conversion rates
-        fig = px.bar(
-            device_funnel,
-            x='Device',
-            y=['Product View Rate', 'Cart Rate', 'Conversion Rate'],
-            title='Conversion Rates by Device Type',
-            barmode='group',
-            labels={'value': 'Rate (%)', 'variable': 'Funnel Stage'}
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Table
-        st.dataframe(
-            device_funnel.style.format({
-                'Sessions': '{:,}',
-                'Product Views': '{:,}',
-                'Cart Adds': '{:,}',
-                'Purchases': '{:,}',
-                'Product View Rate': '{:.2f}%',
-                'Cart Rate': '{:.2f}%',
-                'Conversion Rate': '{:.2f}%'
-            }),
-            use_container_width=True
-        )
-    else:
-        st.info("Device type data not available")
-    
-    # INSIGHTS
-    st.markdown("---")
-    st.subheader("💡 Optimization Recommendations")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if product_view_rate < 50:
-            st.error(f"""
-            **⚠️ Low Product View Rate ({product_view_rate:.1f}%)**
-            
-            **Possible Issues:**
-            - Poor navigation
-            - Unclear value proposition
-            - Slow page load times
-            
-            **Recommendations:**
-            - Improve homepage clarity
-            - Add prominent product categories
-            - Optimize site speed
-            """)
-        else:
-            st.success(f"""
-            **✅ Good Product View Rate ({product_view_rate:.1f}%)**
-            
-            Users are successfully finding products
-            """)
-    
-    with col2:
-        if cart_to_purchase_rate < 30:
-            st.error(f"""
-            **⚠️ Low Cart→Purchase Rate ({cart_to_purchase_rate:.1f}%)**
-            
-            **Possible Issues:**
-            - Checkout friction
-            - Unexpected shipping costs
-            - Payment issues
-            - Trust concerns
-            
-            **Recommendations:**
-            - Simplify checkout process
-            - Show shipping costs upfront
-            - Add trust badges
-            - Enable guest checkout
-            """)
-        else:
-            st.success(f"""
-            **✅ Good Cart→Purchase Rate ({cart_to_purchase_rate:.1f}%)**
-            
-            Checkout process is working well
-            """)
-    
-    with col3:
-        if avg_time_to_purchase > 30:
-            st.warning(f"""
-            **⏰ Long Purchase Journey ({avg_time_to_purchase:.0f} min)**
-            
-            **Possible Reasons:**
-            - High consideration products
-            - Complex product catalog
-            - Users comparing options
-            
-            **Recommendations:**
-            - Add comparison tools
-            - Improve product recommendations
-            - Add customer reviews
-            """)
-        else:
-            st.success(f"""
-            **⚡ Quick Purchase Journey ({avg_time_to_purchase:.0f} min)**
-            
-            Users make fast decisions
-            """)
 
-# ==============================================================================
-# PAGE 3: PRODUCT PERFORMANCE
-# ==============================================================================
+    # Extract date from session time
+    merged['date'] = merged['time_session'].dt.date
 
-def page_product_performance(data, filters):
-    """Product Performance Dashboard"""
-    
-    st.markdown('<div class="main-header">📦 Product Performance</div>', unsafe_allow_html=True)
-    st.markdown("### Analyze product sales and identify opportunities")
-    
-    # Filter data
-    df = data['product_performance'][
-        (data['product_performance']['date'] >= filters['start_date']) &
-        (data['product_performance']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if filters['products']:
-        df = df[df['product_name'].isin(filters['products'])]
-    
-    if df.empty:
-        st.warning("No product data available for selected filters")
-        return
-    
-    # Aggregate by product
-    product_summary = df.groupby('product_name').agg({
-        'total_revenue': 'sum',
-        'total_quantity_sold': 'sum',
-        'times_purchased': 'sum',
-        'times_added_to_cart': 'sum',
-        'cart_to_purchase_rate': 'mean'
-    }).reset_index()
-    
-    product_summary = product_summary.sort_values('total_revenue', ascending=False)
-    
-    # TOP METRICS
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_product_revenue = product_summary['total_revenue'].sum()
-        st.metric("💰 Total Revenue", f"${total_product_revenue:,.0f}")
-    
-    with col2:
-        total_quantity = product_summary['total_quantity_sold'].sum()
-        st.metric("📦 Units Sold", f"{total_quantity:,.0f}")
-    
-    with col3:
-        unique_products = len(product_summary)
-        st.metric("🏷️ Active Products", f"{unique_products:,}")
-    
-    with col4:
-        avg_cart_to_purchase = product_summary['cart_to_purchase_rate'].mean()
-        st.metric("🎯 Avg Cart→Purchase", f"{avg_cart_to_purchase:.1f}%")
-    
-    # TOP PRODUCTS
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🏆 Top 10 Products by Revenue")
-        
-        top_10_revenue = product_summary.head(10)
-        
-        fig = px.bar(
-            top_10_revenue,
-            y='product_name',
-            x='total_revenue',
-            orientation='h',
-            title='Top Products by Revenue',
-            labels={'total_revenue': 'Revenue ($)', 'product_name': 'Product'},
-            color='total_revenue',
-            color_continuous_scale='Blues'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("📊 Top 10 Products by Units Sold")
-        
-        top_10_qty = product_summary.nlargest(10, 'total_quantity_sold')
-        
-        fig = px.bar(
-            top_10_qty,
-            y='product_name',
-            x='total_quantity_sold',
-            orientation='h',
-            title='Top Products by Quantity',
-            labels={'total_quantity_sold': 'Units Sold', 'product_name': 'Product'},
-            color='total_quantity_sold',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # CART TO PURCHASE RATE ANALYSIS
-    st.markdown("---")
-    st.subheader("🎯 Cart-to-Purchase Conversion by Product")
-    
-    # Filter products with enough data
-    products_with_data = product_summary[product_summary['times_added_to_cart'] >= 10].copy()
-    products_with_data = products_with_data.sort_values('cart_to_purchase_rate', ascending=False)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**🌟 Best Performing Products (High Conversion)**")
-        top_performers = products_with_data.head(10)
-        
-        fig = px.bar(
-            top_performers,
-            y='product_name',
-            x='cart_to_purchase_rate',
-            orientation='h',
-            labels={'cart_to_purchase_rate': 'Conversion Rate (%)', 'product_name': 'Product'},
-            color='cart_to_purchase_rate',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.markdown("**⚠️ Underperforming Products (Low Conversion)**")
-        bottom_performers = products_with_data.tail(10)
-        
-        fig = px.bar(
-            bottom_performers,
-            y='product_name',
-            x='cart_to_purchase_rate',
-            orientation='h',
-            labels={'cart_to_purchase_rate': 'Conversion Rate (%)', 'product_name': 'Product'},
-            color='cart_to_purchase_rate',
-            color_continuous_scale='Reds_r'
-        )
-        
-        fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total descending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # PRODUCT TREND ANALYSIS
-    st.markdown("---")
-    st.subheader("📈 Product Trend Analysis")
-    
-    # Select product for trend
-    selected_product = st.selectbox(
-        "Select a product to view trend",
-        options=sorted(df['product_name'].unique()),
-        index=0
-    )
-    
-    if selected_product:
-        product_trend = df[df['product_name'] == selected_product].sort_values('date')
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.line(
-                product_trend,
-                x='date',
-                y='total_revenue',
-                title=f'Revenue Trend: {selected_product}',
-                labels={'total_revenue': 'Revenue ($)', 'date': 'Date'}
-            )
-            
-            fig.update_traces(line_color='#1f77b4', line_width=2)
-            fig.update_layout(height=350, plot_bgcolor='white')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.line(
-                product_trend,
-                x='date',
-                y='total_quantity_sold',
-                title=f'Units Sold Trend: {selected_product}',
-                labels={'total_quantity_sold': 'Units', 'date': 'Date'}
-            )
-            
-            fig.update_traces(line_color='#2ca02c', line_width=2)
-            fig.update_layout(height=350, plot_bgcolor='white')
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # DETAILED TABLE
-    st.markdown("---")
-    st.subheader("📋 Detailed Product Performance Table")
-    
-    # Add calculated columns
-    product_summary['avg_price'] = (product_summary['total_revenue'] / product_summary['total_quantity_sold']).round(2)
-    
-    # Display table with formatting
-    st.dataframe(
-        product_summary.style.format({
-            'total_revenue': '${:,.2f}',
-            'total_quantity_sold': '{:,.0f}',
-            'times_purchased': '{:,.0f}',
-            'times_added_to_cart': '{:,.0f}',
-            'cart_to_purchase_rate': '{:.2f}%',
-            'avg_price': '${:.2f}'
-        }).background_gradient(subset=['total_revenue'], cmap='Blues'),
-        use_container_width=True,
-        height=400
-    )
-    
-    # INSIGHTS
-    st.markdown("---")
-    st.subheader("💡 Product Insights")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Revenue concentration
-        top_10_revenue_pct = (top_10_revenue['total_revenue'].sum() / total_product_revenue * 100)
-        
-        st.info(f"""
-        **📊 Revenue Concentration**
-        
-        Top 10 products generate **{top_10_revenue_pct:.1f}%** of total revenue
-        
-        {
-            "⚠️ High concentration - diversify product mix" if top_10_revenue_pct > 70 
-            else "✅ Healthy revenue distribution"
-        }
-        """)
-    
-    with col2:
-        # Average conversion
-        good_conversion = len(products_with_data[products_with_data['cart_to_purchase_rate'] > 50])
-        poor_conversion = len(products_with_data[products_with_data['cart_to_purchase_rate'] < 30])
-        
-        st.info(f"""
-        **🎯 Conversion Quality**
-        
-        - ✅ High conversion (>50%): **{good_conversion}** products
-        - ⚠️ Low conversion (<30%): **{poor_conversion}** products
-        
-        Focus on improving low-conversion products
-        """)
-    
-    with col3:
-        # Best performer details
-        best_product = product_summary.iloc[0]
-        
-        st.info(f"""
-        **🏆 Star Product**
-        
-        **{best_product['product_name']}**
-        
-        - Revenue: ${best_product['total_revenue']:,.0f}
-        - Units: {best_product['total_quantity_sold']:,.0f}
-        - Conv: {best_product['cart_to_purchase_rate']:.1f}%
-        """)
+    # Conversion flag: 1 if order exists for this session, else 0
+    log_message("  Calculating conversion flags...")
+    merged['converted'] = merged['order_id'].notna().astype(int)
 
-# ==============================================================================
-# PAGE 4: CUSTOMER SEGMENTATION (RFM)
-# ==============================================================================
+    # Gross revenue: total_price before discount (0 if not converted)
+    merged['gross_revenue'] = merged['total_price'].fillna(0)
 
-def page_customer_segmentation(data, filters):
-    """Customer Segmentation Dashboard"""
-    
-    st.markdown('<div class="main-header">👥 Customer Segmentation (RFM Analysis)</div>', unsafe_allow_html=True)
-    st.markdown("### Understand customer value and behavior patterns")
-    
-    df = data['user_lifetime'].copy()
-    
-    # Convert to datetime for comparison
-    df['last_order_date'] = pd.to_datetime(df['last_order_date'])
-    
-    # Filter by date if last order was in range
-    df_filtered = df[
-        (df['last_order_date'] >= filters['start_date']) &
-        (df['last_order_date'] <= filters['end_date'])
-    ] if filters else df
-    
-    # Use all data for lifetime metrics but show filtered stats
-    total_customers = len(df)
-    active_customers = len(df_filtered)
-    
-    # SUMMARY METRICS
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("👥 Total Customers", f"{total_customers:,}")
-    
-    with col2:
-        avg_ltv = df['total_revenue'].mean()
-        st.metric("💰 Avg Customer LTV", f"${avg_ltv:,.0f}")
-    
-    with col3:
-        total_ltv = df['total_revenue'].sum()
-        st.metric("💎 Total Customer Value", f"${total_ltv:,.0f}")
-    
-    with col4:
-        avg_orders = df['total_orders'].mean()
-        st.metric("🛍️ Avg Orders/Customer", f"{avg_orders:.1f}")
-    
-    # RFM SEGMENT DISTRIBUTION
-    st.markdown("---")
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("🎯 Customer Segment Distribution")
-        
-        segment_counts = df['rfm_segment'].value_counts().reset_index()
-        segment_counts.columns = ['Segment', 'Count']
-        
-        fig = px.pie(
-            segment_counts,
-            values='Count',
-            names='Segment',
-            title='Customer Segments',
-            hole=0.4,
-            color_discrete_sequence=px.colors.qualitative.Set3
-        )
-        
-        fig.update_layout(height=450)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("💰 Revenue by Segment")
-        
-        segment_revenue = df.groupby('rfm_segment').agg({
-            'total_revenue': 'sum',
-            'user_id': 'count'
-        }).reset_index()
-        
-        segment_revenue.columns = ['Segment', 'Revenue', 'Customers']
-        segment_revenue = segment_revenue.sort_values('Revenue', ascending=False)
-        
-        fig = px.bar(
-            segment_revenue,
-            x='Segment',
-            y='Revenue',
-            title='Total Revenue by Segment',
-            labels={'Revenue': 'Revenue ($)', 'Segment': 'Customer Segment'},
-            color='Revenue',
-            color_continuous_scale='Viridis'
-        )
-        
-        fig.update_layout(height=450, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # SEGMENT DETAILS
-    st.markdown("---")
-    st.subheader("📊 Segment Performance Details")
-    
-    segment_stats = df.groupby('rfm_segment').agg({
-        'user_id': 'count',
-        'total_revenue': ['sum', 'mean'],
-        'total_orders': 'mean',
-        'avg_order_value': 'mean',
-        'days_since_last_order': 'mean'
-    }).reset_index()
-    
-    segment_stats.columns = [
-        'Segment',
-        'Customers',
-        'Total Revenue',
-        'Avg LTV',
-        'Avg Orders',
-        'Avg AOV',
-        'Avg Days Since Purchase'
+    # Discount amount (0 if not converted or no coupon)
+    merged['discount_amount'] = merged['discount'].fillna(0)
+
+    # Net revenue: gross minus discount
+    merged['net_revenue'] = (merged['gross_revenue'] - merged['discount_amount']).round(2)
+
+    # Select output columns
+    log_message("  Selecting columns...")
+    output_columns = [
+        'session_id',
+        'user_id',
+        'date',
+        'platform',
+        'device_type',
+        'country',
+        'region',
+        'city',
+        'browser',
+        'referrer',
+        'landing_page',
+        'utm_source',
+        'utm_medium',
+        'utm_campaign',
+        'converted',
+        'order_id',
+        'discount_coupon_code',
+        'gross_revenue',
+        'discount_amount',
+        'net_revenue'
     ]
-    
-    segment_stats = segment_stats.sort_values('Total Revenue', ascending=False)
-    
-    # Add percentage
-    segment_stats['% of Customers'] = (segment_stats['Customers'] / total_customers * 100).round(1)
-    segment_stats['% of Revenue'] = (segment_stats['Total Revenue'] / total_ltv * 100).round(1)
-    
-    st.dataframe(
-        segment_stats.style.format({
-            'Customers': '{:,}',
-            'Total Revenue': '${:,.0f}',
-            'Avg LTV': '${:,.0f}',
-            'Avg Orders': '{:.1f}',
-            'Avg AOV': '${:.2f}',
-            'Avg Days Since Purchase': '{:.0f}',
-            '% of Customers': '{:.1f}%',
-            '% of Revenue': '{:.1f}%'
-        }).background_gradient(subset=['Total Revenue'], cmap='Greens'),
-        use_container_width=True
-    )
-    
-    # LTV DISTRIBUTION
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("💎 Customer Lifetime Value Distribution")
-        
-        # Create LTV buckets
-        ltv_buckets = pd.cut(
-            df['total_revenue'],
-            bins=[0, 50, 200, 500, 1000, float('inf')],
-            labels=['$0-50', '$50-200', '$200-500', '$500-1000', '$1000+']
-        )
-        
-        ltv_dist = ltv_buckets.value_counts().sort_index().reset_index()
-        ltv_dist.columns = ['LTV Range', 'Customers']
-        
-        fig = px.bar(
-            ltv_dist,
-            x='LTV Range',
-            y='Customers',
-            title='Customer Distribution by LTV',
-            labels={'Customers': 'Number of Customers', 'LTV Range': 'LTV Bucket'},
-            color='Customers',
-            color_continuous_scale='Blues'
-        )
-        
-        fig.update_layout(height=350, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("📊 RFM Score Distribution")
-        
-        # Breakdown of R, F, M scores
-        rfm_breakdown = pd.DataFrame({
-            'Recency Score': df['rfm_recency_score'].value_counts().sort_index(),
-            'Frequency Score': df['rfm_frequency_score'].value_counts().sort_index(),
-            'Monetary Score': df['rfm_monetary_score'].value_counts().sort_index()
-        }).fillna(0).astype(int)
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(name='Recency', x=rfm_breakdown.index, y=rfm_breakdown['Recency Score']))
-        fig.add_trace(go.Bar(name='Frequency', x=rfm_breakdown.index, y=rfm_breakdown['Frequency Score']))
-        fig.add_trace(go.Bar(name='Monetary', x=rfm_breakdown.index, y=rfm_breakdown['Monetary Score']))
-        
-        fig.update_layout(
-            title='RFM Score Distribution (1=Worst, 5=Best)',
-            barmode='group',
-            xaxis_title='Score',
-            yaxis_title='Number of Customers',
-            height=350,
-            xaxis={'tickmode': 'linear', 'tick0': 1, 'dtick': 1}
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # CUSTOMER RETENTION
-    st.markdown("---")
-    st.subheader("🔄 Customer Retention Analysis")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if 'has_purchase_last_year' in df.columns:
-            retention_data = df['has_purchase_last_year'].value_counts().reset_index()
-            retention_data.columns = ['Status', 'Count']
-            retention_data['Status'] = retention_data['Status'].map({1: 'Purchased Last Year', 0: 'No Purchase Last Year'})
-            
-            fig = px.pie(
-                retention_data,
-                values='Count',
-                names='Status',
-                title='Customer Retention (Year-over-Year)',
-                hole=0.4,
-                color_discrete_sequence=['#2ecc71', '#e74c3c']
-            )
-            
-            fig.update_layout(height=350)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            retention_rate = (retention_data[retention_data['Status'] == 'Purchased Last Year']['Count'].sum() / 
-                            total_customers * 100)
-            
-            st.markdown(f"""
-            **Retention Rate**: {retention_rate:.1f}%
-            
-            {
-                "✅ Strong retention!" if retention_rate > 40 
-                else "⚠️ Focus on retention campaigns" if retention_rate > 20
-                else "🚨 Critical retention issue"
-            }
-            """)
-    
-    with col2:
-        # Days since last order distribution
-        fig = px.histogram(
-            df,
-            x='days_since_last_order',
-            nbins=30,
-            title='Recency Distribution (Days Since Last Order)',
-            labels={'days_since_last_order': 'Days', 'count': 'Customers'},
-            color_discrete_sequence=['#3498db']
-        )
-        
-        fig.update_layout(height=350, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Add recency insights
-        at_risk = len(df[df['days_since_last_order'] > 90])
-        lost = len(df[df['days_since_last_order'] > 365])
-        
-        st.markdown(f"""
-        **Recency Insights:**
-        - At Risk (>90 days): {at_risk:,} customers ({at_risk/total_customers*100:.1f}%)
-        - Lost (>365 days): {lost:,} customers ({lost/total_customers*100:.1f}%)
-        """)
-    
-    # ACTION RECOMMENDATIONS
-    st.markdown("---")
-    st.subheader("🎯 Recommended Actions by Segment")
-    
-    recommendations = {
-        'Champion': {
-            'emoji': '🏆',
-            'description': 'Your best customers - recent, frequent, high-value',
-            'actions': [
-                'Enroll in VIP loyalty program',
-                'Offer early access to new products',
-                'Request referrals and reviews',
-                'Send exclusive discount codes'
-            ]
-        },
-        'Loyal Customer': {
-            'emoji': '💎',
-            'description': 'Regular buyers with consistent purchase patterns',
-            'actions': [
-                'Implement loyalty rewards program',
-                'Send personalized product recommendations',
-                'Offer subscription or auto-replenish options',
-                'Request testimonials'
-            ]
-        },
-        'Potential Loyalist': {
-            'emoji': '🌱',
-            'description': 'Recent buyers showing promise',
-            'actions': [
-                'Send nurture email sequences',
-                'Offer second-purchase incentive',
-                'Provide educational content',
-                'Cross-sell complementary products'
-            ]
-        },
-        'At Risk': {
-            'emoji': '⚠️',
-            'description': 'Previously active but haven\'t bought recently',
-            'actions': [
-                'Launch win-back email campaign',
-                'Survey why they stopped buying',
-                'Offer "We miss you" discount',
-                'Highlight new products/features'
-            ]
-        },
-        'Lost': {
-            'emoji': '😔',
-            'description': 'Inactive for >365 days',
-            'actions': [
-                'Send aggressive re-engagement discount (20-30%)',
-                'Test different messaging angles',
-                'Consider removing from active lists to save costs',
-                'Last-chance campaign before permanent opt-out'
-            ]
-        },
-        'New Customer': {
-            'emoji': '🎉',
-            'description': 'Just made first 1-2 purchases',
-            'actions': [
-                'Welcome series with brand story',
-                'Onboarding email sequence',
-                'First repeat purchase incentive',
-                'Request feedback on initial experience'
-            ]
-        }
-    }
-    
-    # Display recommendations in expandable sections
-    for segment, info in recommendations.items():
-        if segment in df['rfm_segment'].values:
-            with st.expander(f"{info['emoji']} {segment} - {info['description']}"):
-                customer_count = len(df[df['rfm_segment'] == segment])
-                revenue = df[df['rfm_segment'] == segment]['total_revenue'].sum()
-                
-                st.markdown(f"**Customers**: {customer_count:,} ({customer_count/total_customers*100:.1f}%)")
-                st.markdown(f"**Total Revenue**: ${revenue:,.0f}")
-                st.markdown("**Recommended Actions:**")
-                for action in info['actions']:
-                    st.markdown(f"- {action}")
+
+    available_columns = [col for col in output_columns if col in merged.columns]
+    result_df = merged[available_columns].copy()
+
+    # Round monetary values
+    result_df['gross_revenue'] = result_df['gross_revenue'].round(2)
+    result_df['discount_amount'] = result_df['discount_amount'].round(2)
+
+    # Fill missing UTM / coupon values
+    for col in ['utm_source', 'utm_medium', 'utm_campaign']:
+        if col in result_df.columns:
+            result_df[col] = result_df[col].fillna('direct')
+
+    if 'discount_coupon_code' in result_df.columns:
+        result_df['discount_coupon_code'] = result_df['discount_coupon_code'].fillna('NO_COUPON')
+
+    log_message(f"✓ Created {len(result_df)} session records")
+    log_message(f"  Converted sessions: {result_df['converted'].sum()}")
+    log_message(f"  Conversion rate: {result_df['converted'].mean()*100:.2f}%")
+    log_message(f"  Total gross revenue: ${result_df['gross_revenue'].sum():,.2f}")
+    log_message(f"  Total net revenue:   ${result_df['net_revenue'].sum():,.2f}")
+
+    return result_df
+
 
 # ==============================================================================
-# PAGE 5: MARKETING ATTRIBUTION
+# AGGREGATION FUNCTION 3: SESSION FUNNEL
 # ==============================================================================
 
-def page_marketing_attribution(data, filters):
-    """Marketing Attribution Dashboard"""
-    
-    st.markdown('<div class="main-header">📣 Marketing Attribution</div>', unsafe_allow_html=True)
-    st.markdown("### Measure ROI of marketing channels and campaigns")
-    
-    # Filter data
-    df = data['session_attribution'][
-        (data['session_attribution']['date'] >= filters['start_date']) &
-        (data['session_attribution']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if filters['sources']:
-        df = df[df['utm_source'].isin(filters['sources'])]
-    
-    if df.empty:
-        st.warning("No attribution data available for selected filters")
-        return
-    
-    # Calculate metrics by source
-    source_metrics = df.groupby('utm_source').agg({
-        'session_id': 'count',
-        'converted': 'sum',
-        'revenue': 'sum'
-    }).reset_index()
-    
-    source_metrics.columns = ['Source', 'Sessions', 'Conversions', 'Revenue']
-    source_metrics['Conversion Rate'] = (source_metrics['Conversions'] / source_metrics['Sessions'] * 100).round(2)
-    source_metrics['Revenue per Session'] = (source_metrics['Revenue'] / source_metrics['Sessions']).round(2)
-    source_metrics = source_metrics.sort_values('Revenue', ascending=False)
-    
-    # TOP METRICS
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_sessions = source_metrics['Sessions'].sum()
-        st.metric("🔗 Total Sessions", f"{total_sessions:,}")
-    
-    with col2:
-        total_conversions = source_metrics['Conversions'].sum()
-        st.metric("✅ Total Conversions", f"{total_conversions:,}")
-    
-    with col3:
-        total_revenue = source_metrics['Revenue'].sum()
-        st.metric("💰 Attributed Revenue", f"${total_revenue:,.0f}")
-    
-    with col4:
-        overall_conv_rate = (total_conversions / total_sessions * 100) if total_sessions > 0 else 0
-        st.metric("📈 Overall Conv Rate", f"{overall_conv_rate:.2f}%")
-    
-    # CHANNEL PERFORMANCE
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("💰 Revenue by Channel")
-        
-        fig = px.bar(
-            source_metrics.head(10),
-            x='Source',
-            y='Revenue',
-            title='Top 10 Channels by Revenue',
-            labels={'Revenue': 'Revenue ($)', 'Source': 'Traffic Source'},
-            color='Revenue',
-            color_continuous_scale='Viridis'
-        )
-        
-        fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🎯 Conversion Rate by Channel")
-        
-        # Only show channels with >100 sessions for fair comparison
-        source_metrics_filtered = source_metrics[source_metrics['Sessions'] >= 100]
-        
-        fig = px.bar(
-            source_metrics_filtered.sort_values('Conversion Rate', ascending=False).head(10),
-            x='Source',
-            y='Conversion Rate',
-            title='Top 10 Channels by Conversion Rate (min 100 sessions)',
-            labels={'Conversion Rate': 'Conversion Rate (%)', 'Source': 'Traffic Source'},
-            color='Conversion Rate',
-            color_continuous_scale='RdYlGn'
-        )
-        
-        fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # TRAFFIC SOURCES PIE CHART
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🌐 Traffic Distribution")
-        
-        fig = px.pie(
-            source_metrics.head(8),
-            values='Sessions',
-            names='Source',
-            title='Session Distribution by Source',
-            hole=0.4
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("💸 Revenue Distribution")
-        
-        fig = px.pie(
-            source_metrics.head(8),
-            values='Revenue',
-            names='Source',
-            title='Revenue Distribution by Source',
-            hole=0.4,
-            color_discrete_sequence=px.colors.sequential.RdBu
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # CAMPAIGN PERFORMANCE
-    st.markdown("---")
-    st.subheader("📢 Campaign Performance")
-    
-    if 'utm_campaign' in df.columns:
-        campaign_metrics = df[df['utm_campaign'] != 'direct'].groupby('utm_campaign').agg({
-            'session_id': 'count',
-            'converted': 'sum',
-            'revenue': 'sum'
-        }).reset_index()
-        
-        campaign_metrics.columns = ['Campaign', 'Sessions', 'Conversions', 'Revenue']
-        campaign_metrics['Conversion Rate'] = (campaign_metrics['Conversions'] / campaign_metrics['Sessions'] * 100).round(2)
-        campaign_metrics = campaign_metrics.sort_values('Revenue', ascending=False).head(15)
-        
-        fig = px.bar(
-            campaign_metrics,
-            x='Campaign',
-            y='Revenue',
-            title='Top 15 Campaigns by Revenue',
-            labels={'Revenue': 'Revenue ($)', 'Campaign': 'Campaign Name'},
-            color='Conversion Rate',
-            color_continuous_scale='RdYlGn',
-            hover_data=['Sessions', 'Conversions', 'Conversion Rate']
-        )
-        
-        fig.update_layout(height=500, xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # TRAFFIC TREND OVER TIME
-    st.markdown("---")
-    st.subheader("📊 Traffic Trend by Source")
-    
-    # Daily sessions by source
-    daily_source = df.groupby(['date', 'utm_source']).agg({
-        'session_id': 'count'
-    }).reset_index()
-    
-    daily_source.columns = ['Date', 'Source', 'Sessions']
-    
-    # Only show top 5 sources for clarity
-    top_5_sources = source_metrics.head(5)['Source'].tolist()
-    daily_source_filtered = daily_source[daily_source['Source'].isin(top_5_sources)]
-    
-    fig = px.line(
-        daily_source_filtered,
-        x='Date',
-        y='Sessions',
-        color='Source',
-        title='Daily Sessions by Top 5 Traffic Sources',
-        labels={'Sessions': 'Number of Sessions', 'Date': 'Date'}
-    )
-    
-    fig.update_layout(height=400, hovermode='x unified')
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # DETAILED CHANNEL TABLE
-    st.markdown("---")
-    st.subheader("📋 Detailed Channel Performance")
-    
-    st.dataframe(
-        source_metrics.style.format({
-            'Sessions': '{:,}',
-            'Conversions': '{:,}',
-            'Revenue': '${:,.2f}',
-            'Conversion Rate': '{:.2f}%',
-            'Revenue per Session': '${:.2f}'
-        }).background_gradient(subset=['Revenue'], cmap='Greens'),
-        use_container_width=True,
-        height=400
-    )
-    
-    # INSIGHTS & RECOMMENDATIONS
-    st.markdown("---")
-    st.subheader("💡 Marketing Insights")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Best ROI channel
-        best_channel = source_metrics.iloc[0]
-        
-        st.success(f"""
-        **🏆 Top Performing Channel**
-        
-        **{best_channel['Source']}**
-        
-        - Revenue: ${best_channel['Revenue']:,.0f}
-        - Sessions: {best_channel['Sessions']:,}
-        - Conv Rate: {best_channel['Conversion Rate']:.2f}%
-        
-        **Action**: Increase budget allocation
-        """)
-    
-    with col2:
-        # High traffic, low conversion
-        high_traffic_low_conv = source_metrics[
-            (source_metrics['Sessions'] > source_metrics['Sessions'].median()) &
-            (source_metrics['Conversion Rate'] < overall_conv_rate)
-        ]
-        
-        if not high_traffic_low_conv.empty:
-            problem_channel = high_traffic_low_conv.iloc[0]
-            
-            st.warning(f"""
-            **⚠️ Needs Optimization**
-            
-            **{problem_channel['Source']}**
-            
-            - High traffic: {problem_channel['Sessions']:,} sessions
-            - Low conversion: {problem_channel['Conversion Rate']:.2f}%
-            
-            **Action**: Review targeting, landing pages
-            """)
-        else:
-            st.info("All channels performing well!")
-    
-    with col3:
-        # Direct traffic analysis
-        direct_traffic = source_metrics[source_metrics['Source'] == 'direct']
-        
-        if not direct_traffic.empty:
-            direct = direct_traffic.iloc[0]
-            direct_pct = (direct['Sessions'] / total_sessions * 100)
-            
-            st.info(f"""
-            **🔗 Direct Traffic**
-            
-            {direct_pct:.1f}% of all sessions
-            
-            - Sessions: {direct['Sessions']:,}
-            - Revenue: ${direct['Revenue']:,.0f}
-            
-            {
-                "✅ Good brand recognition" if direct_pct > 30
-                else "Consider brand awareness campaigns"
-            }
-            """)
+def create_session_funnel(sessions_df, pageviews_df, cart_df, orders_df):
+    """
+    Tracks each session's progress through the 5-step conversion funnel
 
-# ==============================================================================
-# PAGE 6: PAGE ENGAGEMENT & UX
-# ==============================================================================
+    PURPOSE:
+    - Identify exactly where users drop off
+    - Calculate conversion rate at each funnel step
+    - Optimize low-performing steps
 
-def page_engagement_ux(data, filters):
-    """Page Engagement & UX Dashboard"""
-    
-    st.markdown('<div class="main-header">📄 Page Engagement & UX</div>', unsafe_allow_html=True)
-    st.markdown("### Optimize website content and user experience")
-    
-    # Filter data
-    df = data['page_engagement'][
-        (data['page_engagement']['date'] >= filters['start_date']) &
-        (data['page_engagement']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if df.empty:
-        st.warning("No page engagement data available for selected date range")
-        return
-    
-    # Aggregate by page
-    page_summary = df.groupby('path').agg({
-        'pageviews': 'sum',
-        'unique_users': 'sum',
-        'sessions_with_page': 'sum',
-        'avg_scroll_depth': 'mean',
-        'total_clicks': 'sum'
-    }).reset_index()
-    
-    page_summary['click_per_pageview'] = (page_summary['total_clicks'] / page_summary['pageviews']).round(2)
-    page_summary = page_summary.sort_values('pageviews', ascending=False)
-    
-    # TOP METRICS
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_pageviews = page_summary['pageviews'].sum()
-        st.metric("👁️ Total Pageviews", f"{total_pageviews:,}")
-    
-    with col2:
-        unique_pages = len(page_summary)
-        st.metric("📄 Unique Pages", f"{unique_pages:,}")
-    
-    with col3:
-        avg_scroll = page_summary['avg_scroll_depth'].mean()
-        st.metric("📜 Avg Scroll Depth", f"{avg_scroll:.1f}%")
-    
-    with col4:
-        total_clicks = page_summary['total_clicks'].sum()
-        st.metric("🖱️ Total Clicks", f"{total_clicks:,}")
-    
-    # TOP PAGES
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🔝 Top 10 Most Viewed Pages")
-        
-        top_10_pages = page_summary.head(10)
-        
-        fig = px.bar(
-            top_10_pages,
-            y='path',
-            x='pageviews',
-            orientation='h',
-            title='Top Pages by Pageviews',
-            labels={'pageviews': 'Pageviews', 'path': 'Page Path'},
-            color='pageviews',
-            color_continuous_scale='Blues'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("📊 Engagement by Page")
-        
-        # Show top 10 by unique users
-        top_engagement = page_summary.nlargest(10, 'unique_users')
-        
-        fig = px.bar(
-            top_engagement,
-            y='path',
-            x='unique_users',
-            orientation='h',
-            title='Top Pages by Unique Users',
-            labels={'unique_users': 'Unique Users', 'path': 'Page Path'},
-            color='unique_users',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # SCROLL DEPTH ANALYSIS
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📜 Pages with Best Engagement (High Scroll)")
-        
-        high_scroll = page_summary[page_summary['pageviews'] >= 50].nlargest(10, 'avg_scroll_depth')
-        
-        fig = px.bar(
-            high_scroll,
-            y='path',
-            x='avg_scroll_depth',
-            orientation='h',
-            title='Top 10 Pages by Scroll Depth (min 50 views)',
-            labels={'avg_scroll_depth': 'Avg Scroll Depth (%)', 'path': 'Page Path'},
-            color='avg_scroll_depth',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("⚠️ Pages with Low Engagement (Low Scroll)")
-        
-        low_scroll = page_summary[page_summary['pageviews'] >= 50].nsmallest(10, 'avg_scroll_depth')
-        
-        fig = px.bar(
-            low_scroll,
-            y='path',
-            x='avg_scroll_depth',
-            orientation='h',
-            title='Bottom 10 Pages by Scroll Depth (min 50 views)',
-            labels={'avg_scroll_depth': 'Avg Scroll Depth (%)', 'path': 'Page Path'},
-            color='avg_scroll_depth',
-            color_continuous_scale='Reds_r'
-        )
-        
-        fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total descending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # CLICK ANALYSIS
-    st.markdown("---")
-    st.subheader("🖱️ Click-Through Rate Analysis")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Pages with high clicks
-        high_ctr = page_summary[page_summary['pageviews'] >= 50].nlargest(10, 'click_per_pageview')
-        
-        fig = px.bar(
-            high_ctr,
-            y='path',
-            x='click_per_pageview',
-            orientation='h',
-            title='Pages with Highest Click Rate',
-            labels={'click_per_pageview': 'Clicks per Pageview', 'path': 'Page Path'},
-            color='click_per_pageview',
-            color_continuous_scale='Purples'
-        )
-        
-        fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Scatter: Pageviews vs Scroll Depth
-        fig = px.scatter(
-            page_summary[page_summary['pageviews'] >= 20],
-            x='pageviews',
-            y='avg_scroll_depth',
-            size='total_clicks',
-            hover_data=['path'],
-            title='Pageviews vs Engagement (size = clicks)',
-            labels={
-                'pageviews': 'Pageviews',
-                'avg_scroll_depth': 'Avg Scroll Depth (%)'
-            },
-            color='avg_scroll_depth',
-            color_continuous_scale='Viridis'
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # PAGE CATEGORY ANALYSIS
-    st.markdown("---")
-    st.subheader("📂 Performance by Page Type")
-    
-    # Extract page type from path
-    def categorize_page(path):
-        if pd.isna(path):
-            return 'Other'
-        path = path.lower()
-        if '/product' in path:
-            return 'Product Page'
-        elif '/category' in path or '/collection' in path:
-            return 'Category Page'
-        elif '/cart' in path:
-            return 'Cart'
-        elif '/checkout' in path:
-            return 'Checkout'
-        elif path == '/' or path == '/home':
-            return 'Homepage'
-        elif '/blog' in path or '/article' in path:
-            return 'Blog/Content'
-        else:
-            return 'Other'
-    
-    page_summary['page_type'] = page_summary['path'].apply(categorize_page)
-    
-    type_summary = page_summary.groupby('page_type').agg({
-        'pageviews': 'sum',
-        'avg_scroll_depth': 'mean',
-        'click_per_pageview': 'mean'
-    }).reset_index()
-    
-    type_summary = type_summary.sort_values('pageviews', ascending=False)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        fig = px.bar(
-            type_summary,
-            x='page_type',
-            y='pageviews',
-            title='Pageviews by Page Type',
-            labels={'pageviews': 'Total Pageviews', 'page_type': 'Page Type'},
-            color='pageviews',
-            color_continuous_scale='Blues'
-        )
-        
-        fig.update_layout(height=350, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        fig = px.bar(
-            type_summary,
-            x='page_type',
-            y='avg_scroll_depth',
-            title='Avg Scroll Depth by Page Type',
-            labels={'avg_scroll_depth': 'Avg Scroll Depth (%)', 'page_type': 'Page Type'},
-            color='avg_scroll_depth',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=350, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # DETAILED TABLE
-    st.markdown("---")
-    st.subheader("📋 Detailed Page Performance")
-    
-    st.dataframe(
-        page_summary.head(50).style.format({
-            'pageviews': '{:,}',
-            'unique_users': '{:,}',
-            'sessions_with_page': '{:,}',
-            'avg_scroll_depth': '{:.1f}%',
-            'total_clicks': '{:,}',
-            'click_per_pageview': '{:.2f}'
-        }).background_gradient(subset=['pageviews'], cmap='Blues'),
-        use_container_width=True,
-        height=400
-    )
-    
-    # INSIGHTS
-    st.markdown("---")
-    st.subheader("💡 UX Optimization Recommendations")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # Low scroll pages
-        low_engagement_pages = len(page_summary[
-            (page_summary['avg_scroll_depth'] < 30) &
-            (page_summary['pageviews'] >= 50)
-        ])
-        
-        st.warning(f"""
-        **⚠️ Low Engagement Pages**
-        
-        {low_engagement_pages} pages with <30% scroll depth
-        
-        **Possible Issues:**
-        - Content too long or boring
-        - Slow page load
-        - Unclear value proposition
-        
-        **Action**: Review content structure
-        """)
-    
-    with col2:
-        # High traffic, low clicks
-        high_traffic_low_clicks = page_summary[
-            (page_summary['pageviews'] >= page_summary['pageviews'].median()) &
-            (page_summary['click_per_pageview'] < 1)
-        ]
-        
-        if not high_traffic_low_clicks.empty:
-            st.warning(f"""
-            **🖱️ Low Click-Through**
-            
-            {len(high_traffic_low_clicks)} popular pages with <1 click/view
-            
-            **Possible Issues:**
-            - Weak CTAs
-            - Unclear next steps
-            - Dead-end pages
-            
-            **Action**: Add prominent CTAs
-            """)
-    
-    with col3:
-        # Best performing page type
-        best_type = type_summary.iloc[0]
-        
-        st.success(f"""
-        **✅ Top Page Type**
-        
-        **{best_type['page_type']}**
-        
-        - Views: {best_type['pageviews']:,.0f}
-        - Scroll: {best_type['avg_scroll_depth']:.1f}%
-        
-        Apply successful patterns to other page types
-        """)
+    FUNNEL STEPS & URL LOGIC (path matching uses str.contains — partial match):
+    ┌─────┬──────────────────────┬──────────────────────────────────────────────────────┐
+    │Step │ Field                │ Path pattern matched in pageview_table               │
+    ├─────┼──────────────────────┼──────────────────────────────────────────────────────┤
+    │  1  │ had_category_view    │ contains '/category/security-cameras'                │
+    │  2  │ had_product_view     │ contains '/products/' (all 4 product pages)          │
+    │     │                      │   /products/video-doorbell-pro-2                     │
+    │     │                      │   /products/ring-alarm-8-piece                       │
+    │     │                      │   /products/indoor-cam-(2nd-gen)                     │
+    │     │                      │   /products/stick-up-cam-battery                     │
+    │  3  │ had_cart_view        │ contains '/cart'                                     │
+    │  4  │ had_checkout         │ contains '/checkout/payment'                         │
+    │  5  │ had_thank_you        │ contains '/checkout/thankyou'                        │
+    └─────┴──────────────────────┴──────────────────────────────────────────────────────┘
 
-# ==============================================================================
-# PAGE 7: DISCOUNT & PROMOTION ANALYSIS
-# ==============================================================================
+    NOTE: user_id is resolved via session_id join from session_table
+          (not taken directly from event tables)
 
-def page_promotions(data, filters):
-    """Discount & Promotion Analysis Dashboard"""
-    
-    st.markdown('<div class="main-header">💰 Discount & Promotion Analysis</div>', unsafe_allow_html=True)
-    st.markdown("### Measure effectiveness of promotional campaigns")
-    
-    # Filter data
-    df = data['coupon_performance'][
-        (data['coupon_performance']['date'] >= filters['start_date']) &
-        (data['coupon_performance']['date'] <= filters['end_date'])
-    ].copy()
-    
-    if df.empty:
-        st.warning("No coupon data available for selected date range")
-        return
-    
-    # Separate coupon vs non-coupon orders
-    with_coupon = df[df['discount_coupon_code'] != 'NO_COUPON']
-    without_coupon = df[df['discount_coupon_code'] == 'NO_COUPON']
-    
-    # Calculate totals
-    total_discount = with_coupon['total_discount_given'].sum()
-    revenue_with_coupon = with_coupon['total_revenue'].sum()
-    revenue_without_coupon = without_coupon['total_revenue'].sum()
-    total_revenue = revenue_with_coupon + revenue_without_coupon
-    
-    orders_with_coupon = with_coupon['usage_count'].sum()
-    orders_without_coupon = without_coupon['usage_count'].sum()
-    total_orders = orders_with_coupon + orders_without_coupon
-    
-    # TOP METRICS
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("💸 Total Discount Given", f"${total_discount:,.0f}")
-    
-    with col2:
-        coupon_pct = (revenue_with_coupon / total_revenue * 100) if total_revenue > 0 else 0
-        st.metric("📊 % Revenue with Coupons", f"{coupon_pct:.1f}%")
-    
-    with col3:
-        aov_with = revenue_with_coupon / orders_with_coupon if orders_with_coupon > 0 else 0
-        st.metric("💳 AOV (with coupon)", f"${aov_with:.2f}")
-    
-    with col4:
-        aov_without = revenue_without_coupon / orders_without_coupon if orders_without_coupon > 0 else 0
-        st.metric("💳 AOV (no coupon)", f"${aov_without:.2f}")
-    
-    # COUPON VS NON-COUPON COMPARISON
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Revenue Distribution")
-        
-        revenue_comparison = pd.DataFrame({
-            'Type': ['With Coupon', 'Without Coupon'],
-            'Revenue': [revenue_with_coupon, revenue_without_coupon],
-            'Orders': [orders_with_coupon, orders_without_coupon]
-        })
-        
-        fig = px.pie(
-            revenue_comparison,
-            values='Revenue',
-            names='Type',
-            title='Revenue: Coupon vs No Coupon',
-            hole=0.4,
-            color_discrete_sequence=['#ff6b6b', '#4ecdc4']
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🛍️ Order Distribution")
-        
-        fig = px.pie(
-            revenue_comparison,
-            values='Orders',
-            names='Type',
-            title='Orders: Coupon vs No Coupon',
-            hole=0.4,
-            color_discrete_sequence=['#ff6b6b', '#4ecdc4']
-        )
-        
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # AOV COMPARISON
-    st.markdown("---")
-    st.subheader("💵 Average Order Value Comparison")
-    
-    comparison_data = pd.DataFrame({
-        'Order Type': ['With Coupon', 'Without Coupon'],
-        'AOV': [aov_with, aov_without]
-    })
-    
-    fig = px.bar(
-        comparison_data,
-        x='Order Type',
-        y='AOV',
-        title='Average Order Value: Coupon vs No Coupon',
-        labels={'AOV': 'Average Order Value ($)', 'Order Type': ''},
-        color='AOV',
-        color_continuous_scale='RdYlGn',
-        text='AOV'
-    )
-    
-    fig.update_traces(texttemplate='$%{text:.2f}', textposition='outside')
-    fig.update_layout(height=400, showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    aov_diff = ((aov_with - aov_without) / aov_without * 100) if aov_without > 0 else 0
-    
-    if aov_with > aov_without:
-        st.success(f"✅ Coupons increase AOV by {aov_diff:.1f}% - customers buy more with discounts!")
+    HOW TO ADD A NEW FUNNEL STEP:
+    1. Add a new path pattern below following the same pattern as existing steps
+    2. Add the new field name to output_columns
+    3. Add it to the funnel_steps list in the logging section
+
+    Args:
+        sessions_df (DataFrame): Session data
+        pageviews_df (DataFrame): Pageview data
+        cart_df (DataFrame): Add-to-cart data (not used in current funnel)
+        orders_df (DataFrame): Order data (used for time metrics)
+
+    Returns:
+        DataFrame: Session-level funnel data with one row per session
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: session_funnel")
+    log_message("="*60)
+
+    if sessions_df is None:
+        log_message("⚠ Skipping - missing session data")
+        return None
+
+    log_message("  Building funnel base...")
+    funnel = sessions_df[['session_id', 'user_id', 'time']].copy()
+    funnel['date'] = funnel['time'].dt.date
+
+    # Helper: get session_ids that visited pages matching a given path pattern
+    def sessions_with_path(pattern):
+        """
+        Returns set of session_ids where at least one pageview path
+        contains the given pattern (case-insensitive partial match).
+
+        Args:
+            pattern (str): URL substring to search for e.g. '/cart'
+
+        Returns:
+            numpy array of matching session_ids
+        """
+        if pageviews_df is None or 'path' not in pageviews_df.columns:
+            return []
+        return pageviews_df[
+            pageviews_df['path'].str.contains(pattern, case=False, na=False)
+        ]['session_id'].unique()
+
+    # -------------------------------------------------------------------------
+    # STEP 1: CATEGORY VIEW
+    # Did this session view the security cameras category page?
+    # Path pattern: contains '/category/security-cameras'
+    # -------------------------------------------------------------------------
+    log_message("  Checking category views (/category/security-cameras)...")
+    funnel['had_category_view'] = funnel['session_id'].isin(
+        sessions_with_path('/category/security-cameras')
+    ).astype(int)
+
+    # -------------------------------------------------------------------------
+    # STEP 2: PRODUCT VIEW
+    # Did this session view any individual product page?
+    # Path pattern: contains '/products/' — matches all 4 product URLs:
+    #   /products/video-doorbell-pro-2
+    #   /products/ring-alarm-8-piece
+    #   /products/indoor-cam-(2nd-gen)
+    #   /products/stick-up-cam-battery
+    # -------------------------------------------------------------------------
+    log_message("  Checking product views (/products/)...")
+    funnel['had_product_view'] = funnel['session_id'].isin(
+        sessions_with_path('/products/')
+    ).astype(int)
+
+    # -------------------------------------------------------------------------
+    # STEP 3: CART VIEW
+    # Did this session view the cart page?
+    # Path pattern: contains '/cart'
+    # -------------------------------------------------------------------------
+    log_message("  Checking cart views (/cart)...")
+    funnel['had_cart_view'] = funnel['session_id'].isin(
+        sessions_with_path('/cart')
+    ).astype(int)
+
+    # -------------------------------------------------------------------------
+    # STEP 4: CHECKOUT
+    # Did this session reach the checkout/payment page?
+    # Path pattern: contains '/checkout/payment'
+    # -------------------------------------------------------------------------
+    log_message("  Checking checkout views (/checkout/payment)...")
+    funnel['had_checkout'] = funnel['session_id'].isin(
+        sessions_with_path('/checkout/payment')
+    ).astype(int)
+
+    # -------------------------------------------------------------------------
+    # STEP 5: THANK YOU PAGE (ORDER CONFIRMED)
+    # Did this session reach the thank you / order confirmed page?
+    # Path pattern: contains '/checkout/thankyou'
+    # NOTE: This is the definitive signal of a completed purchase.
+    # -------------------------------------------------------------------------
+    log_message("  Checking thank you page views (/checkout/thankyou)...")
+    funnel['had_thank_you'] = funnel['session_id'].isin(
+        sessions_with_path('/checkout/thankyou')
+    ).astype(int)
+
+    # -------------------------------------------------------------------------
+    # TIME METRICS
+    # How long (in minutes) from session start to key events?
+    # -------------------------------------------------------------------------
+    log_message("  Calculating time metrics...")
+
+    # Time from session start → first category page view
+    if pageviews_df is not None:
+        first_category = pageviews_df[
+            pageviews_df['path'].str.contains('/category/security-cameras', case=False, na=False)
+        ].groupby('session_id')['time'].min().reset_index()
+        first_category.columns = ['session_id', 'first_category_time']
+
+        funnel = funnel.merge(first_category, on='session_id', how='left')
+        funnel['time_to_category_minutes'] = (
+            (funnel['first_category_time'] - funnel['time']).dt.total_seconds() / 60
+        ).round(2)
+        funnel = funnel.drop(columns=['first_category_time'])
     else:
-        st.warning(f"⚠️ Coupons decrease AOV by {abs(aov_diff):.1f}% - customers may use coupons only for cheap items")
-    
-    # TOP COUPONS
-    st.markdown("---")
-    st.subheader("🏆 Most Popular Coupons")
-    
-    coupon_summary = with_coupon.groupby('discount_coupon_code').agg({
-        'usage_count': 'sum',
-        'total_discount_given': 'sum',
-        'total_revenue': 'sum',
-        'avg_order_value': 'mean',
-        'discount_percentage': 'mean'
-    }).reset_index()
-    
-    coupon_summary = coupon_summary.sort_values('usage_count', ascending=False).head(15)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        fig = px.bar(
-            coupon_summary,
-            y='discount_coupon_code',
-            x='usage_count',
-            orientation='h',
-            title='Top 15 Coupons by Usage',
-            labels={'usage_count': 'Times Used', 'discount_coupon_code': 'Coupon Code'},
-            color='usage_count',
-            color_continuous_scale='Oranges'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        fig = px.bar(
-            coupon_summary,
-            y='discount_coupon_code',
-            x='total_revenue',
-            orientation='h',
-            title='Top 15 Coupons by Revenue Generated',
-            labels={'total_revenue': 'Revenue ($)', 'discount_coupon_code': 'Coupon Code'},
-            color='total_revenue',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # DISCOUNT DEPTH ANALYSIS
-    st.markdown("---")
-    st.subheader("📉 Discount Depth Analysis")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Distribution of discount percentages
-        discount_buckets = pd.cut(
-            with_coupon['discount_percentage'],
-            bins=[0, 10, 20, 30, 40, 100],
-            labels=['0-10%', '10-20%', '20-30%', '30-40%', '40%+']
-        )
-        
-        discount_dist = discount_buckets.value_counts().sort_index().reset_index()
-        discount_dist.columns = ['Discount Range', 'Count']
-        
-        fig = px.bar(
-            discount_dist,
-            x='Discount Range',
-            y='Count',
-            title='Distribution of Discount Levels',
-            labels={'Count': 'Number of Orders', 'Discount Range': 'Discount %'},
-            color='Count',
-            color_continuous_scale='Reds'
-        )
-        
-        fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Revenue by discount level
-        with_coupon_copy = with_coupon.copy()
-        with_coupon_copy['discount_bucket'] = pd.cut(
-            with_coupon_copy['discount_percentage'],
-            bins=[0, 10, 20, 30, 40, 100],
-            labels=['0-10%', '10-20%', '20-30%', '30-40%', '40%+']
-        )
-        
-        revenue_by_discount = with_coupon_copy.groupby('discount_bucket')['total_revenue'].sum().reset_index()
-        revenue_by_discount.columns = ['Discount Range', 'Revenue']
-        
-        fig = px.bar(
-            revenue_by_discount,
-            x='Discount Range',
-            y='Revenue',
-            title='Revenue by Discount Level',
-            labels={'Revenue': 'Total Revenue ($)', 'Discount Range': 'Discount %'},
-            color='Revenue',
-            color_continuous_scale='Greens'
-        )
-        
-        fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # DISCOUNT TREND OVER TIME
-    st.markdown("---")
-    st.subheader("📈 Discount Trend Over Time")
-    
-    daily_discount = with_coupon.groupby('date').agg({
-        'total_discount_given': 'sum',
-        'total_revenue': 'sum',
-        'usage_count': 'sum'
-    }).reset_index()
-    
-    daily_discount['discount_rate'] = (daily_discount['total_discount_given'] / daily_discount['total_revenue'] * 100).round(2)
-    
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    fig.add_trace(
-        go.Scatter(x=daily_discount['date'], y=daily_discount['total_discount_given'], 
-                   name="Discount Given", line=dict(color='red', width=2)),
-        secondary_y=False
-    )
-    
-    fig.add_trace(
-        go.Scatter(x=daily_discount['date'], y=daily_discount['usage_count'], 
-                   name="Coupon Usage", line=dict(color='blue', width=2)),
-        secondary_y=True
-    )
-    
-    fig.update_xaxes(title_text="Date")
-    fig.update_yaxes(title_text="Discount Given ($)", secondary_y=False)
-    fig.update_yaxes(title_text="Coupon Usage Count", secondary_y=True)
-    fig.update_layout(title="Daily Discount Trend", height=400, hovermode='x unified')
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # DETAILED TABLE
-    st.markdown("---")
-    st.subheader("📋 Detailed Coupon Performance")
-    
-    st.dataframe(
-        coupon_summary.style.format({
-            'usage_count': '{:,}',
-            'total_discount_given': '${:,.2f}',
-            'total_revenue': '${:,.2f}',
-            'avg_order_value': '${:.2f}',
-            'discount_percentage': '{:.2f}%'
-        }).background_gradient(subset=['total_revenue'], cmap='Greens'),
-        use_container_width=True,
-        height=400
-    )
-    
-    # INSIGHTS
-    st.markdown("---")
-    st.subheader("💡 Promotion Insights & Recommendations")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        roi = ((revenue_with_coupon - total_discount) / total_discount * 100) if total_discount > 0 else 0
-        
-        if roi > 200:
-            st.success(f"""
-            **✅ Great ROI**
-            
-            Every $1 in discounts generates ${roi/100:.2f} in revenue
-            
-            **Action**: Coupons are profitable, continue strategy
-            """)
-        elif roi > 100:
-            st.info(f"""
-            **✔️ Positive ROI**
-            
-            Every $1 in discounts generates ${roi/100:.2f} in revenue
-            
-            **Action**: Monitor closely, optimize discount depth
-            """)
-        else:
-            st.warning(f"""
-            **⚠️ Low ROI**
-            
-            Every $1 in discounts generates ${roi/100:.2f} in revenue
-            
-            **Action**: Reduce discount depth or frequency
-            """)
-    
-    with col2:
-        if coupon_pct > 70:
-            st.warning(f"""
-            **⚠️ Over-Reliance on Discounts**
-            
-            {coupon_pct:.1f}% of revenue uses coupons
-            
-            **Risk**: Brand devaluation, margin erosion
-            
-            **Action**: 
-            - Test reducing discount frequency
-            - Focus on value proposition
-            """)
-        else:
-            st.success(f"""
-            **✅ Balanced Discount Strategy**
-            
-            {coupon_pct:.1f}% of revenue uses coupons
-            
-            Good mix of full-price and discounted sales
-            """)
-    
-    with col3:
-        # Best performing coupon
-        if not coupon_summary.empty:
-            best_coupon = coupon_summary.iloc[0]
-            
-            st.info(f"""
-            **🏆 Top Coupon**
-            
-            Code: **{best_coupon['discount_coupon_code']}**
-            
-            - Used: {best_coupon['usage_count']:,.0f} times
-            - Revenue: ${best_coupon['total_revenue']:,.0f}
-            - Avg discount: {best_coupon['discount_percentage']:.1f}%
-            
-            Replicate this coupon structure
-            """)
+        funnel['time_to_category_minutes'] = None
+
+    # Time from session start → first product page view
+    if pageviews_df is not None:
+        first_product = pageviews_df[
+            pageviews_df['path'].str.contains('/products/', case=False, na=False)
+        ].groupby('session_id')['time'].min().reset_index()
+        first_product.columns = ['session_id', 'first_product_time']
+
+        funnel = funnel.merge(first_product, on='session_id', how='left')
+        funnel['time_to_product_minutes'] = (
+            (funnel['first_product_time'] - funnel['time']).dt.total_seconds() / 60
+        ).round(2)
+        funnel = funnel.drop(columns=['first_product_time'])
+    else:
+        funnel['time_to_product_minutes'] = None
+
+    # Time from session start → first cart page view
+    if pageviews_df is not None:
+        first_cart_view = pageviews_df[
+            pageviews_df['path'].str.contains('/cart', case=False, na=False)
+        ].groupby('session_id')['time'].min().reset_index()
+        first_cart_view.columns = ['session_id', 'first_cart_view_time']
+
+        funnel = funnel.merge(first_cart_view, on='session_id', how='left')
+        funnel['time_to_cart_minutes'] = (
+            (funnel['first_cart_view_time'] - funnel['time']).dt.total_seconds() / 60
+        ).round(2)
+        funnel = funnel.drop(columns=['first_cart_view_time'])
+    else:
+        funnel['time_to_cart_minutes'] = None
+
+    # Time from session start → checkout page
+    if pageviews_df is not None:
+        first_checkout = pageviews_df[
+            pageviews_df['path'].str.contains('/checkout/payment', case=False, na=False)
+        ].groupby('session_id')['time'].min().reset_index()
+        first_checkout.columns = ['session_id', 'first_checkout_time']
+
+        funnel = funnel.merge(first_checkout, on='session_id', how='left')
+        funnel['time_to_checkout_minutes'] = (
+            (funnel['first_checkout_time'] - funnel['time']).dt.total_seconds() / 60
+        ).round(2)
+        funnel = funnel.drop(columns=['first_checkout_time'])
+    else:
+        funnel['time_to_checkout_minutes'] = None
+
+    # Time from session start → thank you page (order confirmed)
+    if pageviews_df is not None:
+        first_thankyou = pageviews_df[
+            pageviews_df['path'].str.contains('/checkout/thankyou', case=False, na=False)
+        ].groupby('session_id')['time'].min().reset_index()
+        first_thankyou.columns = ['session_id', 'first_thankyou_time']
+
+        funnel = funnel.merge(first_thankyou, on='session_id', how='left')
+        funnel['time_to_thankyou_minutes'] = (
+            (funnel['first_thankyou_time'] - funnel['time']).dt.total_seconds() / 60
+        ).round(2)
+        funnel = funnel.drop(columns=['first_thankyou_time'])
+    else:
+        funnel['time_to_thankyou_minutes'] = None
+
+    # -------------------------------------------------------------------------
+    # OUTPUT
+    # -------------------------------------------------------------------------
+    output_columns = [
+        'session_id',
+        'user_id',
+        'date',
+        'had_category_view',     # Step 1: /category/security-cameras
+        'had_product_view',      # Step 2: /products/*
+        'had_cart_view',         # Step 3: /cart
+        'had_checkout',          # Step 4: /checkout/payment
+        'had_thank_you',         # Step 5: /checkout/thankyou
+        'time_to_category_minutes',
+        'time_to_product_minutes',
+        'time_to_cart_minutes',
+        'time_to_checkout_minutes',
+        'time_to_thankyou_minutes'
+    ]
+
+    result_df = funnel[output_columns].copy()
+
+    # Log funnel breakdown
+    total = len(result_df)
+    funnel_steps = [
+        ('Category View',       'had_category_view'),
+        ('Product View',        'had_product_view'),
+        ('Cart View',           'had_cart_view'),
+        ('Checkout',            'had_checkout'),
+        ('Thank You (Purchase)', 'had_thank_you'),
+    ]
+
+    log_message(f"✓ Created {total} session funnel records")
+    log_message(f"  Funnel breakdown:")
+    for label, col in funnel_steps:
+        count = result_df[col].sum()
+        log_message(f"    {label:<25} {count:>6} ({count/total*100:.1f}%)")
+
+    return result_df
+
 
 # ==============================================================================
-# MAIN APP
+# AGGREGATION FUNCTION 4: PRODUCT PERFORMANCE
 # ==============================================================================
+
+def create_product_performance_daily(order_items_df, cart_df, pageviews_df):
+    """
+    Daily performance metrics for each product
+
+    PURPOSE:
+    - Identify best/worst selling products
+    - Track product trends over time
+    - Optimize inventory and merchandising
+
+    PRICING RULE:
+    - product_price = unit price only (never pre-multiplied)
+    - line_revenue  = product_price x product_qty
+
+    KNOWN PRODUCTS & UNIT PRICES:
+    - Video Doorbell Pro 2   = $249.99
+    - Ring Alarm 8-piece     = $249.99
+    - Indoor Cam (2nd Gen)   = $59.99
+    - Stick Up Cam Battery   = $99.99
+
+    METRICS PER PRODUCT PER DAY:
+    - times_purchased: count of line item rows (each row = one order line)
+    - total_quantity_sold: sum of product_qty
+    - total_revenue: sum of (product_price x product_qty)
+    - times_added_to_cart: count from add_to_cart_table
+    - cart_to_purchase_rate: (times_purchased / times_added_to_cart) * 100
+
+    Args:
+        order_items_df (DataFrame): Order line items
+        cart_df (DataFrame): Cart additions
+        pageviews_df (DataFrame): Page views (reserved for future product view metric)
+
+    Returns:
+        DataFrame: Product-level daily metrics
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: product_performance_daily")
+    log_message("="*60)
+
+    if order_items_df is None:
+        log_message("⚠ Skipping - missing order items data")
+        return None
+
+    order_items_df['date'] = order_items_df['time'].dt.date
+
+    log_message("  Aggregating order line item data...")
+
+    # Times purchased = count of line item rows per product per day
+    times_purchased = order_items_df.groupby(
+        ['date', 'product_name']
+    )['event_id'].count()
+
+    # Total quantity sold = sum of product_qty
+    quantity_sold = order_items_df.groupby(
+        ['date', 'product_name']
+    )['product_qty'].sum()
+
+    # Line revenue = product_price (unit) x product_qty
+    # product_price is always unit price — confirmed by validate_product_prices()
+    order_items_df['line_revenue'] = (
+        order_items_df['product_price'] * order_items_df['product_qty']
+    )
+    revenue = order_items_df.groupby(['date', 'product_name'])['line_revenue'].sum()
+
+    product_metrics = pd.DataFrame({
+        'times_purchased':    times_purchased,
+        'total_quantity_sold': quantity_sold,
+        'total_revenue':      revenue
+    }).reset_index()
+
+    # Cart additions per product per day
+    log_message("  Adding cart data...")
+    if cart_df is not None:
+        cart_df['date'] = cart_df['time'].dt.date
+        cart_adds = cart_df.groupby(
+            ['date', 'product_name']
+        )['event_id'].count().reset_index()
+        cart_adds.columns = ['date', 'product_name', 'times_added_to_cart']
+
+        product_metrics = product_metrics.merge(
+            cart_adds, on=['date', 'product_name'], how='left'
+        )
+        product_metrics['times_added_to_cart'] = (
+            product_metrics['times_added_to_cart'].fillna(0).astype(int)
+        )
+
+        # Cart-to-purchase rate: what % of cart adds resulted in purchase?
+        product_metrics['cart_to_purchase_rate'] = (
+            product_metrics['times_purchased'] /
+            product_metrics['times_added_to_cart'] * 100
+        ).fillna(0).round(2)
+    else:
+        product_metrics['times_added_to_cart'] = 0
+        product_metrics['cart_to_purchase_rate'] = 0
+
+    product_metrics['total_revenue'] = product_metrics['total_revenue'].round(2)
+
+    product_metrics = product_metrics.sort_values(
+        ['date', 'total_revenue'], ascending=[True, False]
+    )
+
+    log_message(f"✓ Created {len(product_metrics)} product-day records")
+    log_message(f"  Unique products: {product_metrics['product_name'].nunique()}")
+    log_message(f"  Date range: {product_metrics['date'].min()} to {product_metrics['date'].max()}")
+    log_message(f"  Total revenue: ${product_metrics['total_revenue'].sum():,.2f}")
+
+    top_products = product_metrics.groupby('product_name')['total_revenue'].sum().nlargest(5)
+    log_message("  Top products by revenue:")
+    for product, rev in top_products.items():
+        log_message(f"    {product}: ${rev:,.2f}")
+
+    return product_metrics
+
+
+# ==============================================================================
+# AGGREGATION FUNCTION 5: USER LIFETIME METRICS
+# ==============================================================================
+
+def create_user_lifetime_metrics(users_df, orders_df):
+    """
+    One row per user with lifetime statistics
+
+    PURPOSE:
+    - Customer segmentation (VIP, regular, at-risk)
+    - Calculate customer lifetime value (LTV)
+    - Identify customers for retention campaigns
+
+    REVENUE NOTE:
+    - total_revenue here = sum of gross total_price (before discount)
+    - This reflects full basket value the customer generated
+
+    METRICS PER USER:
+    - first_order_date, last_order_date
+    - total_orders (frequency)
+    - total_revenue (gross monetary value)
+    - avg_order_value
+    - days_since_last_order (recency)
+    - RFM scores and segment
+
+    RFM SCORING:
+    R (Recency):   5=last 30d, 4=31-90d, 3=91-180d, 2=181-365d, 1=365d+
+    F (Frequency): 5=10+ orders, 4=5-9, 3=3-4, 2=2, 1=1
+    M (Monetary):  5=$1000+, 4=$500-999, 3=$200-499, 2=$50-199, 1=<$50
+
+    Args:
+        users_df (DataFrame): User data
+        orders_df (DataFrame): Order data
+
+    Returns:
+        DataFrame: User-level lifetime metrics
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: user_lifetime_metrics")
+    log_message("="*60)
+
+    if orders_df is None or users_df is None:
+        log_message("⚠ Skipping - missing required data")
+        return None
+
+    log_message("  Calculating user metrics...")
+
+    user_metrics = orders_df.groupby('user_id').agg(
+        first_order_date=('time', 'min'),
+        last_order_date=('time', 'max'),
+        total_orders=('order_id', 'nunique'),
+        total_revenue=('total_price', 'sum'),       # gross revenue (before discount)
+        total_discount=('discount', 'sum'),          # total discount received
+        avg_order_value=('total_price', 'mean')
+    ).reset_index()
+
+    # Net revenue per user = gross - discount
+    user_metrics['net_revenue'] = (
+        user_metrics['total_revenue'] - user_metrics['total_discount']
+    ).round(2)
+
+    user_metrics['total_revenue'] = user_metrics['total_revenue'].round(2)
+    user_metrics['total_discount'] = user_metrics['total_discount'].round(2)
+    user_metrics['avg_order_value'] = user_metrics['avg_order_value'].round(2)
+
+    # Recency: days since last order
+    log_message("  Calculating recency...")
+    today = pd.Timestamp(datetime.now().date())
+    user_metrics['days_since_last_order'] = (
+        today - user_metrics['last_order_date']
+    ).dt.days
+
+    user_metrics['first_order_date'] = user_metrics['first_order_date'].dt.date
+    user_metrics['last_order_date'] = user_metrics['last_order_date'].dt.date
+
+    # RFM SCORING
+    log_message("  Calculating RFM scores...")
+
+    user_metrics['rfm_recency_score'] = pd.cut(
+        user_metrics['days_since_last_order'],
+        bins=[-1, 30, 90, 180, 365, float('inf')],
+        labels=[5, 4, 3, 2, 1]
+    ).astype(int)
+
+    user_metrics['rfm_frequency_score'] = pd.cut(
+        user_metrics['total_orders'],
+        bins=[0, 1, 2, 4, 9, float('inf')],
+        labels=[1, 2, 3, 4, 5]
+    ).astype(int)
+
+    user_metrics['rfm_monetary_score'] = pd.cut(
+        user_metrics['total_revenue'],
+        bins=[0, 50, 200, 500, 1000, float('inf')],
+        labels=[1, 2, 3, 4, 5]
+    ).astype(int)
+
+    user_metrics['rfm_score'] = (
+        user_metrics['rfm_recency_score'].astype(str) +
+        user_metrics['rfm_frequency_score'].astype(str) +
+        user_metrics['rfm_monetary_score'].astype(str)
+    )
+
+    # SEGMENT ASSIGNMENT
+    log_message("  Assigning customer segments...")
+
+    def assign_segment(rfm_score):
+        r, f, m = int(rfm_score[0]), int(rfm_score[1]), int(rfm_score[2])
+        if r >= 4 and f >= 4 and m >= 4:
+            return 'Champion'
+        elif r >= 3 and f >= 4:
+            return 'Loyal Customer'
+        elif r >= 3 and f >= 2:
+            return 'Potential Loyalist'
+        elif r <= 2 and f >= 3:
+            return 'At Risk'
+        elif r == 1 and f <= 2:
+            return 'Lost'
+        elif r <= 2 and f <= 2:
+            return 'Needs Attention'
+        elif f <= 2:
+            return 'New Customer'
+        else:
+            return 'Regular'
+
+    user_metrics['rfm_segment'] = user_metrics['rfm_score'].apply(assign_segment)
+
+    # Merge original user flags
+    merge_cols = ['user_id']
+    for col in ['has_purchase_last_year', 'has_purchase_last_qtr']:
+        if col in users_df.columns:
+            merge_cols.append(col)
+
+    user_metrics = user_metrics.merge(
+        users_df[merge_cols], on='user_id', how='left'
+    )
+
+    user_metrics = user_metrics.sort_values('total_revenue', ascending=False)
+
+    log_message(f"✓ Created {len(user_metrics)} user records")
+    log_message(f"  Total gross revenue: ${user_metrics['total_revenue'].sum():,.2f}")
+    log_message(f"  Total discounts:     ${user_metrics['total_discount'].sum():,.2f}")
+    log_message(f"  Total net revenue:   ${user_metrics['net_revenue'].sum():,.2f}")
+    log_message(f"  Average LTV (gross): ${user_metrics['total_revenue'].mean():,.2f}")
+
+    log_message("  Customer segment breakdown:")
+    for segment, count in user_metrics['rfm_segment'].value_counts().items():
+        pct = count / len(user_metrics) * 100
+        log_message(f"    {segment}: {count} ({pct:.1f}%)")
+
+    return user_metrics
+
+
+# ==============================================================================
+# AGGREGATION FUNCTION 6: PAGE ENGAGEMENT METRICS
+# ==============================================================================
+
+def create_page_engagement_metrics(pageviews_df, scrolls_df, clicks_df):
+    """
+    Daily engagement metrics for each page
+
+    PURPOSE:
+    - Identify high/low performing pages
+    - UX optimization insights
+    - Content effectiveness measurement
+
+    TABLE FIELDS USED:
+    - pageview_table:  event_id, user_id, session_id, time, domain, path, previous_page
+    - scroll_table:    event_id, user_id, session_id, time, scroll_percent, domain, path
+    - click_table:     event_id, user_id, session_id, time, domain, path, href,
+                       target_id, target_tag, target_text
+
+    METRICS PER PAGE PER DAY:
+    - pageviews: total count of pageview events
+    - unique_users: distinct user_id count (via session join)
+    - sessions_with_page: distinct session_id count
+    - avg_scroll_depth: mean scroll_percent from scroll_table
+    - total_clicks: count of click events on this page
+
+    NOTE: user_id is taken directly from pageview_table (confirmed in schema)
+
+    Args:
+        pageviews_df (DataFrame): Pageview data
+        scrolls_df (DataFrame): Scroll data
+        clicks_df (DataFrame): Click data
+
+    Returns:
+        DataFrame: Page-level daily metrics
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: page_engagement_metrics")
+    log_message("="*60)
+
+    if pageviews_df is None:
+        log_message("⚠ Skipping - missing pageview data")
+        return None
+
+    pageviews_df['date'] = pageviews_df['time'].dt.date
+
+    log_message("  Aggregating pageview data...")
+
+    pageviews_count = pageviews_df.groupby(['date', 'path'])['event_id'].count()
+
+    # user_id available directly in pageview_table schema
+    unique_users = pageviews_df.groupby(['date', 'path'])['user_id'].nunique()
+
+    sessions_count = pageviews_df.groupby(['date', 'path'])['session_id'].nunique()
+
+    page_metrics = pd.DataFrame({
+        'pageviews':          pageviews_count,
+        'unique_users':       unique_users,
+        'sessions_with_page': sessions_count
+    }).reset_index()
+
+    # Average scroll depth per page per day
+    log_message("  Adding scroll data...")
+    if scrolls_df is not None:
+        scrolls_df['date'] = scrolls_df['time'].dt.date
+        avg_scroll = scrolls_df.groupby(
+            ['date', 'path']
+        )['scroll_percent'].mean().reset_index()
+        avg_scroll.columns = ['date', 'path', 'avg_scroll_depth']
+        avg_scroll['avg_scroll_depth'] = avg_scroll['avg_scroll_depth'].round(2)
+
+        page_metrics = page_metrics.merge(avg_scroll, on=['date', 'path'], how='left')
+        page_metrics['avg_scroll_depth'] = page_metrics['avg_scroll_depth'].fillna(0)
+    else:
+        page_metrics['avg_scroll_depth'] = 0
+
+    # Total clicks per page per day
+    log_message("  Adding click data...")
+    if clicks_df is not None:
+        clicks_df['date'] = clicks_df['time'].dt.date
+        clicks_count = clicks_df.groupby(
+            ['date', 'path']
+        )['event_id'].count().reset_index()
+        clicks_count.columns = ['date', 'path', 'total_clicks']
+
+        page_metrics = page_metrics.merge(clicks_count, on=['date', 'path'], how='left')
+        page_metrics['total_clicks'] = page_metrics['total_clicks'].fillna(0).astype(int)
+    else:
+        page_metrics['total_clicks'] = 0
+
+    page_metrics = page_metrics.sort_values(
+        ['date', 'pageviews'], ascending=[True, False]
+    )
+
+    log_message(f"✓ Created {len(page_metrics)} page-day records")
+    log_message(f"  Unique pages: {page_metrics['path'].nunique()}")
+    log_message(f"  Total pageviews: {page_metrics['pageviews'].sum():,}")
+
+    top_pages = page_metrics.groupby('path')['pageviews'].sum().nlargest(5)
+    log_message("  Top 5 pages by pageviews:")
+    for path, views in top_pages.items():
+        log_message(f"    {path}: {views:,} views")
+
+    return page_metrics
+
+
+# ==============================================================================
+# AGGREGATION FUNCTION 7: COUPON PERFORMANCE
+# ==============================================================================
+
+def create_coupon_performance(orders_df):
+    """
+    Daily performance metrics for discount coupons
+
+    PURPOSE:
+    - Measure promotion effectiveness
+    - Calculate ROI of discount campaigns
+    - Identify popular coupons
+
+    COUPON RULES:
+    - HOLIDAY10: 10% discount on total_price
+    - RING20:    20% discount on total_price
+    - NO_COUPON: 0% discount
+
+    NOTE: discount values are validated at load time in validate_and_fix_discounts()
+    so all discount amounts here are guaranteed to be correct.
+
+    METRICS PER COUPON PER DAY:
+    - usage_count: number of orders using this coupon
+    - total_discount_given: sum of discount amounts
+    - gross_revenue: sum of total_price (before discount)
+    - net_revenue: gross_revenue - total_discount_given
+    - avg_order_value: mean total_price
+    - discount_percentage: (total_discount / gross_revenue) * 100
+
+    Args:
+        orders_df (DataFrame): Order data (discounts already validated)
+
+    Returns:
+        DataFrame: Coupon-level daily metrics
+    """
+    log_message("\n" + "="*60)
+    log_message("CREATING: coupon_performance")
+    log_message("="*60)
+
+    if orders_df is None or 'discount_coupon_code' not in orders_df.columns:
+        log_message("⚠ Skipping - missing order data or coupon field")
+        return None
+
+    orders_df['date'] = orders_df['time'].dt.date
+
+    # discount_coupon_code already filled with 'NO_COUPON' by validate_and_fix_discounts()
+
+    log_message("  Aggregating coupon data...")
+
+    coupon_metrics = orders_df.groupby(['date', 'discount_coupon_code']).agg(
+        usage_count=('order_id', 'count'),
+        total_discount_given=('discount', 'sum'),
+        gross_revenue=('total_price', 'sum'),
+        avg_order_value=('total_price', 'mean')
+    ).reset_index()
+
+    # Net revenue = gross minus discount
+    coupon_metrics['net_revenue'] = (
+        coupon_metrics['gross_revenue'] - coupon_metrics['total_discount_given']
+    ).round(2)
+
+    # Discount percentage = (discount / gross) * 100
+    coupon_metrics['discount_percentage'] = (
+        coupon_metrics['total_discount_given'] /
+        coupon_metrics['gross_revenue'] * 100
+    ).round(2)
+
+    # Round monetary values
+    for col in ['total_discount_given', 'gross_revenue', 'avg_order_value']:
+        coupon_metrics[col] = coupon_metrics[col].round(2)
+
+    coupon_metrics = coupon_metrics.sort_values(
+        ['date', 'usage_count'], ascending=[True, False]
+    )
+
+    log_message(f"✓ Created {len(coupon_metrics)} coupon-day records")
+    log_message(f"  Unique coupons: {coupon_metrics['discount_coupon_code'].nunique()}")
+    log_message(f"  Total discount given: ${coupon_metrics['total_discount_given'].sum():,.2f}")
+    log_message(f"  Total gross revenue:  ${coupon_metrics['gross_revenue'].sum():,.2f}")
+    log_message(f"  Total net revenue:    ${coupon_metrics['net_revenue'].sum():,.2f}")
+
+    log_message("  Coupon breakdown:")
+    summary = coupon_metrics.groupby('discount_coupon_code').agg(
+        usage_count=('usage_count', 'sum'),
+        total_discount=('total_discount_given', 'sum')
+    ).sort_values('usage_count', ascending=False)
+
+    for code, row in summary.iterrows():
+        log_message(f"    {code}: {row['usage_count']} uses, ${row['total_discount']:,.2f} discount")
+
+    return coupon_metrics
+
+
+# ==============================================================================
+# SAVE & MAIN
+# ==============================================================================
+
+def save_to_csv(df, filename):
+    """
+    Saves DataFrame to CSV with error handling
+
+    Args:
+        df (DataFrame): Data to save
+        filename (str): Output filename
+    """
+    if df is None or df.empty:
+        log_message(f"⚠ Skipping save - {filename} has no data")
+        return
+
+    try:
+        filepath = os.path.join(Config.AGGREGATED_DATA_DIR, filename)
+        df.to_csv(filepath, index=False)
+        log_message(f"✓ Saved: {filename} ({len(df)} rows)")
+    except Exception as e:
+        log_message(f"✗ Error saving {filename}: {str(e)}")
+
 
 def main():
-    """Main application entry point"""
-    
-    # Load data
-    data = load_data()
-    
-    if data is None:
-        st.stop()
-    
-    # Render sidebar and get filters
-    filters = render_sidebar(data)
-    
-    # Page navigation
-    st.sidebar.markdown("---")
-    st.sidebar.title("📑 Navigation")
-    
-    page = st.sidebar.radio(
-        "Select Page",
-        [
-            "📊 Executive Summary",
-            "🔄 Conversion Funnel",
-            "📦 Product Performance",
-            "👥 Customer Segmentation",
-            "📣 Marketing Attribution",
-            "📄 Page Engagement & UX",
-            "💰 Promotions & Discounts"
-        ]
-    )
-    
-    # Render selected page
-    if page == "📊 Executive Summary":
-        page_executive_summary(data, filters)
-    elif page == "🔄 Conversion Funnel":
-        page_conversion_funnel(data, filters)
-    elif page == "📦 Product Performance":
-        page_product_performance(data, filters)
-    elif page == "👥 Customer Segmentation":
-        page_customer_segmentation(data, filters)
-    elif page == "📣 Marketing Attribution":
-        page_marketing_attribution(data, filters)
-    elif page == "📄 Page Engagement & UX":
-        page_engagement_ux(data, filters)
-    elif page == "💰 Promotions & Discounts":
-        page_promotions(data, filters)
-    
-    # Footer
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("""
-    <div style='text-align: center; color: #666; font-size: 12px;'>
-    📊 E-Commerce Analytics Dashboard<br>
-    Built with Streamlit<br>
-    Last updated: 2026-02-14
-    </div>
-    """, unsafe_allow_html=True)
+    """
+    Main execution function - orchestrates entire pipeline
+
+    WORKFLOW:
+    1. Setup directories
+    2. Load all raw data (with coupon & price validation)
+    3. Create each aggregated table
+    4. Save all aggregated tables
+    5. Log summary
+
+    TO RUN:
+        python ecommerce_data_processor.py
+
+    TO SCHEDULE DAILY (Linux/Mac):
+        crontab -e
+        Add: 0 1 * * * /usr/bin/python3 /path/to/ecommerce_data_processor.py
+
+    TO SCHEDULE DAILY (Windows):
+        Use Task Scheduler to run at 1 AM daily
+    """
+    start_time = datetime.now()
+
+    log_message("\n" + "="*60)
+    log_message("E-COMMERCE DATA AGGREGATION PIPELINE")
+    log_message("="*60)
+    log_message(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    Config.setup_directories()
+
+    # STEP 1: Load all raw data
+    data = load_all_raw_data()
+
+    if data['sessions'] is None or data['orders'] is None:
+        log_message("\n✗ CRITICAL: Missing core data (sessions or orders)")
+        log_message("Cannot continue without minimum required data")
+        return
+
+    # STEP 2: Create aggregated tables
+    daily_metrics  = create_daily_business_metrics(data['orders'], data['sessions'], data['users'])
+    session_attr   = create_session_attribution(data['sessions'], data['orders'])
+    funnel         = create_session_funnel(data['sessions'], data['pageviews'], data['cart'], data['orders'])
+    product_perf   = create_product_performance_daily(data['order_items'], data['cart'], data['pageviews'])
+    user_ltv       = create_user_lifetime_metrics(data['users'], data['orders'])
+    page_engagement = create_page_engagement_metrics(data['pageviews'], data['scrolls'], data['clicks'])
+    coupon_perf    = create_coupon_performance(data['orders'])
+
+    # STEP 3: Save all aggregated tables
+    log_message("\n" + "="*60)
+    log_message("SAVING AGGREGATED TABLES")
+    log_message("="*60)
+
+    save_to_csv(daily_metrics,   'daily_business_metrics.csv')
+    save_to_csv(session_attr,    'session_attribution.csv')
+    save_to_csv(funnel,          'session_funnel.csv')
+    save_to_csv(product_perf,    'product_performance_daily.csv')
+    save_to_csv(user_ltv,        'user_lifetime_metrics.csv')
+    save_to_csv(page_engagement, 'page_engagement_metrics.csv')
+    save_to_csv(coupon_perf,     'coupon_performance.csv')
+
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+
+    log_message("\n" + "="*60)
+    log_message("PIPELINE COMPLETE")
+    log_message("="*60)
+    log_message(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_message(f"Duration: {duration:.2f} seconds")
+    log_message(f"Aggregated files saved to: {Config.AGGREGATED_DATA_DIR}")
+    log_message("="*60)
+
+
+# ==============================================================================
+# RUN
+# ==============================================================================
 
 if __name__ == "__main__":
     main()
