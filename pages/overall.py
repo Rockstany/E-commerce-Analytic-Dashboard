@@ -74,39 +74,60 @@ st.markdown("""
 @st.cache_data
 def load_data():
     """
-    Loads all aggregated CSV files with error handling
-    
+    Loads all aggregated CSV files with error handling and column normalization.
+    Renames columns to match dashboard expectations.
+
     Returns:
         dict: Dictionary containing all DataFrames
     """
     data = {}
-    
+
     try:
-        # Load all aggregated tables
+        # 1. DAILY BUSINESS METRICS
         data['daily_metrics'] = pd.read_csv('aggregated_data/daily_business_metrics.csv')
         data['daily_metrics']['date'] = pd.to_datetime(data['daily_metrics']['date'])
-        
+        # Aggregation script outputs 'net_revenue' — dashboard expects 'total_revenue'
+        data['daily_metrics'] = data['daily_metrics'].rename(columns={
+            'net_revenue': 'total_revenue'
+        })
+
+        # 2. SESSION ATTRIBUTION
         data['session_attribution'] = pd.read_csv('aggregated_data/session_attribution.csv')
         data['session_attribution']['date'] = pd.to_datetime(data['session_attribution']['date'])
-        
+        # Aggregation script outputs 'net_revenue' — dashboard expects 'revenue'
+        data['session_attribution'] = data['session_attribution'].rename(columns={
+            'net_revenue': 'revenue'
+        })
+
+        # 3. SESSION FUNNEL
         data['session_funnel'] = pd.read_csv('aggregated_data/session_funnel.csv')
         data['session_funnel']['date'] = pd.to_datetime(data['session_funnel']['date'])
-        
+        # Aggregation script outputs 'had_cart_view'  — dashboard expects 'had_add_to_cart'
+        # Aggregation script outputs 'had_thank_you'  — dashboard expects 'had_order'
+        data['session_funnel'] = data['session_funnel'].rename(columns={
+            'had_cart_view': 'had_add_to_cart',
+            'had_thank_you': 'had_order'
+        })
+
+        # 4. PRODUCT PERFORMANCE
         data['product_performance'] = pd.read_csv('aggregated_data/product_performance_daily.csv')
         data['product_performance']['date'] = pd.to_datetime(data['product_performance']['date'])
-        
+
+        # 5. USER LIFETIME METRICS
         data['user_lifetime'] = pd.read_csv('aggregated_data/user_lifetime_metrics.csv')
         data['user_lifetime']['first_order_date'] = pd.to_datetime(data['user_lifetime']['first_order_date'])
         data['user_lifetime']['last_order_date'] = pd.to_datetime(data['user_lifetime']['last_order_date'])
-        
+
+        # 6. PAGE ENGAGEMENT
         data['page_engagement'] = pd.read_csv('aggregated_data/page_engagement_metrics.csv')
         data['page_engagement']['date'] = pd.to_datetime(data['page_engagement']['date'])
-        
+
+        # 7. COUPON PERFORMANCE
         data['coupon_performance'] = pd.read_csv('aggregated_data/coupon_performance.csv')
         data['coupon_performance']['date'] = pd.to_datetime(data['coupon_performance']['date'])
-        
+
         return data
-    
+
     except FileNotFoundError as e:
         st.error(f"❌ Data file not found: {e}")
         st.info("Please ensure aggregated data files are in 'aggregated_data/' folder")
@@ -1927,8 +1948,8 @@ def page_promotions(data, filters):
     
     # Calculate totals
     total_discount = with_coupon['total_discount_given'].sum()
-    revenue_with_coupon = with_coupon['total_revenue'].sum()
-    revenue_without_coupon = without_coupon['total_revenue'].sum()
+    revenue_with_coupon = with_coupon['gross_revenue'].sum()
+    revenue_without_coupon = without_coupon['gross_revenue'].sum()
     total_revenue = revenue_with_coupon + revenue_without_coupon
     
     orders_with_coupon = with_coupon['usage_count'].sum()
@@ -2032,10 +2053,13 @@ def page_promotions(data, filters):
     coupon_summary = with_coupon.groupby('discount_coupon_code').agg({
         'usage_count': 'sum',
         'total_discount_given': 'sum',
-        'total_revenue': 'sum',
+        'gross_revenue': 'sum',
         'avg_order_value': 'mean',
         'discount_percentage': 'mean'
     }).reset_index()
+    
+    # Rename gross_revenue to total_revenue for display consistency
+    coupon_summary = coupon_summary.rename(columns={'gross_revenue': 'total_revenue'})
     
     coupon_summary = coupon_summary.sort_values('usage_count', ascending=False).head(15)
     
@@ -2110,7 +2134,7 @@ def page_promotions(data, filters):
             labels=['0-10%', '10-20%', '20-30%', '30-40%', '40%+']
         )
         
-        revenue_by_discount = with_coupon_copy.groupby('discount_bucket')['total_revenue'].sum().reset_index()
+        revenue_by_discount = with_coupon_copy.groupby('discount_bucket')['gross_revenue'].sum().reset_index()
         revenue_by_discount.columns = ['Discount Range', 'Revenue']
         
         fig = px.bar(
@@ -2132,11 +2156,11 @@ def page_promotions(data, filters):
     
     daily_discount = with_coupon.groupby('date').agg({
         'total_discount_given': 'sum',
-        'total_revenue': 'sum',
+        'gross_revenue': 'sum',
         'usage_count': 'sum'
     }).reset_index()
     
-    daily_discount['discount_rate'] = (daily_discount['total_discount_given'] / daily_discount['total_revenue'] * 100).round(2)
+    daily_discount['discount_rate'] = (daily_discount['total_discount_given'] / daily_discount['gross_revenue'] * 100).round(2)
     
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
