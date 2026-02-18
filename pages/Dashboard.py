@@ -201,6 +201,31 @@ def create_metric_card(label, value, change=None, prefix='', suffix=''):
         """
 
 # ==============================================================================
+# NEW KPI HELPER FUNCTIONS (SAFE ADDITIONS)
+# ==============================================================================
+
+def discount_efficiency_ratio(df):
+    """
+    Net Revenue / Gross Order Value (Before Discount)
+    """
+    if 'gross_order_value_before_discount' not in df.columns:
+        return None
+    gross = df['gross_order_value_before_discount'].sum()
+    net   = df['total_revenue'].sum()
+    return (net / gross) if gross > 0 else None
+
+
+def revenue_per_session_index(df):
+    """
+    Channel revenue per session vs overall average
+    """
+    overall = df['revenue'].sum() / df['session_id'].nunique()
+    df = df.copy()
+    df['rev_per_session'] = df['revenue'] / df['session_id']
+    df['rev_per_session_index'] = df['rev_per_session'] / overall
+    return df
+
+# ==============================================================================
 # SIDEBAR FILTERS
 # ==============================================================================
 
@@ -320,6 +345,28 @@ def page_executive_summary(data, filters):
         st.metric("📈 Conversion Rate", f"{yearly_conv:.2f}%")
     with col4:
         st.metric("💵 Avg Order Value", f"${yearly_aov:.2f}")
+
+    # ── NEW KPI: DISCOUNT EFFICIENCY ──────────────────────────────────────────────
+st.markdown("---")
+st.subheader("💸 Pricing & Discount Health")
+
+coupon_df = data['coupon_performance'][
+    data['coupon_performance']['date'].dt.year == 2025
+]
+
+if 'gross_order_value_before_discount' in coupon_df.columns:
+    efficiency = discount_efficiency_ratio(coupon_df)
+    if efficiency:
+        st.metric(
+            "Discount Efficiency Ratio",
+            f"{efficiency*100:.1f}%",
+            help="Net Revenue ÷ Gross Order Value before discount"
+        )
+        st.info(
+            "💡 **Insight:** "
+            + ("Healthy pricing power." if efficiency > 0.9 else
+               "Revenue growth is discount-driven. Monitor margins.")
+        )
 
     # ── MONTHLY AGGREGATION ────────────────────────────────────────────────────
     monthly = df_year.groupby(['year', 'month', 'month_name']).agg(
@@ -777,6 +824,8 @@ def page_product_performance(data, filters):
         st.warning("No product data available for selected filters")
         return
 
+
+
     # Yearly product summary
     yearly_product = df_year.groupby('product_name').agg({
         'total_revenue':       'sum',
@@ -824,6 +873,36 @@ def page_product_performance(data, filters):
         )
         fig.update_layout(height=450, showlegend=False, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
+
+
+    # ── NEW KPI: CART ABANDONMENT HOTSPOTS ─────────────────────────────────────────
+st.markdown("---")
+st.subheader("🚨 Cart Abandonment Hotspots")
+
+if 'cart_abandonment_rate' in df.columns:
+    hotspot = df[['product_name', 'cart_abandonment_rate', 'total_revenue']].dropna()
+
+    fig = px.scatter(
+        hotspot,
+        x='cart_abandonment_rate',
+        y='total_revenue',
+        size='total_revenue',
+        text='product_name',
+        title='High Revenue vs Cart Abandonment',
+        labels={
+            'cart_abandonment_rate': 'Cart Abandonment Rate',
+            'total_revenue': 'Revenue ($)'
+        }
+    )
+    fig.update_traces(textposition='top center')
+    fig.update_layout(height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "💡 **Insight:** Products with high revenue and high abandonment "
+        "are prime candidates for UX or pricing fixes."
+    )
+
 
     # ── MONTHLY SALES TREND PER PRODUCT ───────────────────────────────────────
     st.markdown("---")
@@ -1015,6 +1094,53 @@ def page_customer_segmentation(data, filters):
         data['daily_metrics']['date'].dt.year == 2025
     ].copy()
     daily_orders = add_month_col(daily_orders)
+    
+    # ── NEW KPI: REPEAT PURCHASE VELOCITY ─────────────────────────────────────────
+st.markdown("---")
+st.subheader("⏱️ Repeat Purchase Velocity")
+
+if 'days_between_order_1_and_order_2' in df.columns:
+    velocity = df['days_between_order_1_and_order_2'].dropna()
+
+    st.metric(
+        "Median Days to 2nd Purchase",
+        f"{velocity.median():.0f} days"
+    )
+
+    fig = px.histogram(
+        velocity,
+        nbins=20,
+        title="Days Between First and Second Order",
+        labels={'value': 'Days'}
+    )
+    fig.update_layout(height=300)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "💡 **Insight:** Faster second purchase strongly correlates "
+        "with higher long-term customer value."
+    )
+
+    # ── NEW KPI: REVENUE BY PURCHASE FREQUENCY ────────────────────────────────────
+if 'purchase_frequency_bucket' in df.columns:
+    freq_rev = df.groupby('purchase_frequency_bucket')['total_revenue'].sum().reset_index()
+
+    fig = px.bar(
+        freq_rev,
+        x='purchase_frequency_bucket',
+        y='total_revenue',
+        title='Revenue Contribution by Purchase Frequency',
+        labels={'total_revenue': 'Revenue ($)', 'purchase_frequency_bucket': 'Frequency Bucket'},
+        color='total_revenue'
+    )
+    fig.update_layout(height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "💡 **Insight:** A higher share of revenue from repeat buckets "
+        "indicates sustainable growth."
+    )
+
 
     # Approximate segment revenue monthly using RFM user_lifetime + daily revenue
     # We distribute total monthly revenue proportionally by segment share
@@ -1216,6 +1342,31 @@ def page_marketing_attribution(data, filters):
         tot_c = yearly_source['Conversions'].sum()
         st.metric("📈 Overall Conv Rate", f"{tot_c/tot_s*100:.2f}%" if tot_s > 0 else "N/A")
 
+    # ── NEW KPI: REVENUE PER SESSION INDEX ────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Revenue per Session Index")
+
+    source_df = revenue_per_session_index(df)
+
+    index_chart = source_df.groupby('utm_source')['rev_per_session_index'].mean().reset_index()
+
+    fig = px.bar(
+        index_chart.sort_values('rev_per_session_index', ascending=False),
+        x='utm_source',
+        y='rev_per_session_index',
+        title='Revenue per Session Index by Channel',
+        labels={'rev_per_session_index': 'Index (1 = Avg)'}
+    )
+    fig.add_hline(y=1.0, line_dash="dash", line_color="red")
+    fig.update_layout(height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "💡 **Insight:** Channels above index 1.0 bring higher-intent users. "
+        "Optimize budget allocation accordingly."
+    )
+
+    
     # ── CHANNEL REVENUE & CONVERSION ──────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -1523,6 +1674,34 @@ def page_engagement_ux(data, filters):
     peak_eng_month = monthly_eng.loc[monthly_eng['pageviews'].idxmax()]
     eng_trend      = trend_label(monthly_eng['pageviews'])
     st.info(f"**💡 Engagement Insight:** Peak engagement month: **{peak_eng_month['month_label']}** ({peak_eng_month['pageviews']:,} pageviews). Overall trend: {eng_trend}")
+
+
+    # ── NEW KPI: REVENUE PER PAGEVIEW ─────────────────────────────────────────────
+st.markdown("---")
+st.subheader("💰 Revenue per Pageview")
+
+if 'revenue' in df_year.columns:
+    page_value = df_year.groupby('path').agg(
+        revenue=('revenue', 'sum'),
+        pageviews=('pageviews', 'sum')
+    ).reset_index()
+
+    page_value['revenue_per_pageview'] = page_value['revenue'] / page_value['pageviews']
+    page_value = page_value.sort_values('revenue_per_pageview', ascending=False).head(10)
+
+    fig = px.bar(
+        page_value,
+        x='path',
+        y='revenue_per_pageview',
+        title='Top Pages by Revenue per Pageview'
+    )
+    fig.update_layout(height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "💡 **Insight:** These pages generate disproportionate value "
+        "despite traffic volume."
+    )
 
     # ── PAGE TYPE ANALYSIS ─────────────────────────────────────────────────────
     st.markdown("---")
