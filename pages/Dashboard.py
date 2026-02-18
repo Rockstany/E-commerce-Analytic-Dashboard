@@ -201,28 +201,34 @@ def create_metric_card(label, value, change=None, prefix='', suffix=''):
         """
 
 # ==============================================================================
-# NEW KPI HELPER FUNCTIONS (SAFE ADDITIONS)
+# NEW KPI HELPER FUNCTIONS
 # ==============================================================================
-
-def discount_efficiency_ratio(df):
-    """
-    Net Revenue / Gross Order Value (Before Discount)
-    """
-    if 'gross_order_value_before_discount' not in df.columns:
-        return None
-    gross = df['gross_order_value_before_discount'].sum()
-    net   = df['total_revenue'].sum()
-    return (net / gross) if gross > 0 else None
-
 
 def revenue_per_session_index(df):
     """
-    Channel revenue per session vs overall average
+    Channel revenue per session vs overall average.
+    Returns df with index column added.
     """
-    overall = df['revenue'].sum() / df['session_id'].nunique()
+    # FIX: session_id here is already a count/aggregated column, not raw sessions
+    # We compute per-row rev_per_session as revenue/sessions
     df = df.copy()
-    df['rev_per_session'] = df['revenue'] / df['session_id']
-    df['rev_per_session_index'] = df['rev_per_session'] / overall
+    # Handle case where session_id may be a count col or unique identifier
+    if 'sessions' in df.columns:
+        session_col = 'sessions'
+    else:
+        session_col = 'session_id'
+
+    total_revenue = df['revenue'].sum()
+    total_sessions = df[session_col].sum() if df[session_col].dtype in [int, float] else df[session_col].nunique()
+
+    overall_rps = total_revenue / total_sessions if total_sessions > 0 else 1
+
+    if df[session_col].dtype in [int, float]:
+        df['rev_per_session'] = df['revenue'] / df[session_col].replace(0, np.nan)
+    else:
+        df['rev_per_session'] = df['revenue']  # fallback
+
+    df['rev_per_session_index'] = df['rev_per_session'] / overall_rps
     return df
 
 # ==============================================================================
@@ -347,49 +353,136 @@ def page_executive_summary(data, filters):
         st.metric("💵 Avg Order Value", f"${yearly_aov:.2f}")
 
     # ── NEW KPI: DISCOUNT EFFICIENCY ──────────────────────────────────────────────
-
-    # ── NEW KPI: DISCOUNT EFFICIENCY ──────────────────────────────────────────────
+    # FIX: Replaced undefined variables (coupon_performance_df, selected_year)
+    # with proper data references. Fixed indentation for the gross > 0 block.
     st.markdown("---")
     st.subheader("💸 Pricing & Discount Health")
 
-    coupon_df = coupon_performance_df[
-        coupon_performance_df['date'].dt.year == selected_year
-    ]
+    coupon_df = data['coupon_performance'][
+        data['coupon_performance']['date'].dt.year == 2025
+    ].copy()
 
     if (
         'gross_order_value_before_discount' in coupon_df.columns
-        and 'total_revenue' in coupon_df.columns
-        ):
+        and 'gross_revenue' in coupon_df.columns
+    ):
         gross = coupon_df['gross_order_value_before_discount'].sum()
-        net = coupon_df['total_revenue'].sum()
+        net   = coupon_df['gross_revenue'].sum()
 
-    if gross > 0:
-        efficiency = net / gross
-
-        st.metric(
-            "Discount Efficiency Ratio",
-            f"{efficiency*100:.1f}%",
-            help="Net Revenue ÷ Gross Order Value before discount"
-        )
-
-        st.info(
-            "💡 **Insight:** "
-            + (
-                "Healthy pricing power."
-                if efficiency > 0.9
-                else "Revenue growth is discount-driven. Monitor margins."
+        if gross > 0:
+            efficiency = net / gross
+            st.metric(
+                "Discount Efficiency Ratio",
+                f"{efficiency * 100:.1f}%",
+                help="Net Revenue ÷ Gross Order Value before discount"
             )
-        )
+            st.info(
+                "💡 **Insight:** "
+                + (
+                    "Healthy pricing power — customers are buying largely at full value."
+                    if efficiency > 0.9
+                    else "Revenue growth appears discount-driven. Monitor margins carefully."
+                )
+            )
+    else:
+        # Fallback: derive efficiency from coupon vs no-coupon split
+        with_coupon    = coupon_df[coupon_df.get('discount_coupon_code', pd.Series(dtype=str)) != 'NO_COUPON'] if 'discount_coupon_code' in coupon_df.columns else pd.DataFrame()
+        without_coupon = coupon_df[coupon_df.get('discount_coupon_code', pd.Series(dtype=str)) == 'NO_COUPON'] if 'discount_coupon_code' in coupon_df.columns else pd.DataFrame()
+        if not without_coupon.empty and 'gross_revenue' in coupon_df.columns:
+            total_disc = with_coupon['total_discount_given'].sum() if 'total_discount_given' in with_coupon.columns else 0
+            total_rev  = coupon_df['gross_revenue'].sum()
+            if total_rev > 0:
+                gross_approx = total_rev + total_disc
+                efficiency   = total_rev / gross_approx
+                st.metric("Discount Efficiency Ratio (approx)", f"{efficiency * 100:.1f}%")
 
-    
-    
+    # ── NEW KPI 1: REVENUE PER SESSION ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("⚡ Revenue per Session (Yearly)")
+
+    if yearly_sessions > 0:
+        rps = yearly_revenue / yearly_sessions
+        monthly_rps = df_year.groupby(['month']).apply(
+            lambda g: g['total_revenue'].sum() / g['total_sessions'].sum() if g['total_sessions'].sum() > 0 else 0
+        ).reset_index()
+        monthly_rps.columns = ['month', 'rps']
+        monthly_rps['month_label'] = monthly_rps['month'].apply(get_month_name)
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.metric("💡 Avg Revenue per Session", f"${rps:.2f}")
+            peak_rps_month = monthly_rps.loc[monthly_rps['rps'].idxmax()]
+            low_rps_month  = monthly_rps.loc[monthly_rps['rps'].idxmin()]
+            st.metric("🏆 Best Month",  peak_rps_month['month_label'], f"${peak_rps_month['rps']:.2f}/session")
+            st.metric("📉 Worst Month", low_rps_month['month_label'],  f"${low_rps_month['rps']:.2f}/session")
+            st.info("💡 **Insight:** Revenue per Session combines both conversion rate and AOV. A rising trend signals improving traffic quality or checkout optimisation.")
+        with col2:
+            fig = px.line(
+                monthly_rps, x='month_label', y='rps',
+                title='Monthly Revenue per Session (2025)',
+                labels={'rps': 'Revenue per Session ($)', 'month_label': 'Month'},
+                markers=True
+            )
+            fig.update_traces(line_color='#9b59b6', line_width=2)
+            fig.update_layout(height=320, plot_bgcolor='white')
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── NEW KPI 2: CUSTOMER ACQUISITION COST PROXY ────────────────────────────
+    # Derived as: Paid Channel Revenue ÷ Paid Sessions (a quality proxy when ad spend isn't available)
+    st.markdown("---")
+    st.subheader("🎯 Paid vs Organic Revenue Split")
+
+    attribution_year = data['session_attribution'][
+        data['session_attribution']['date'].dt.year == 2025
+    ].copy()
+
+    if 'utm_source' in attribution_year.columns and 'revenue' in attribution_year.columns:
+        paid_sources   = ['google', 'facebook', 'instagram', 'tiktok', 'bing', 'paid', 'cpc', 'ppc']
+        attribution_year['channel_type'] = attribution_year['utm_source'].str.lower().apply(
+            lambda s: 'Paid' if any(p in str(s) for p in paid_sources) else 'Organic/Other'
+        )
+        channel_split = attribution_year.groupby('channel_type').agg(
+            Revenue  = ('revenue', 'sum'),
+            Sessions = ('session_id', 'count')
+        ).reset_index()
+        channel_split['RPS']         = (channel_split['Revenue'] / channel_split['Sessions']).round(2)
+        channel_split['Revenue_pct'] = (channel_split['Revenue'] / channel_split['Revenue'].sum() * 100).round(1)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.pie(
+                channel_split, values='Revenue', names='channel_type',
+                title='Revenue Split: Paid vs Organic',
+                hole=0.4,
+                color_discrete_sequence=['#e74c3c', '#2ecc71']
+            )
+            fig.update_layout(height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.dataframe(
+                channel_split.style.format({
+                    'Revenue': '${:,.0f}', 'Sessions': '{:,}',
+                    'RPS': '${:.2f}', 'Revenue_pct': '{:.1f}%'
+                }),
+                use_container_width=True
+            )
+            paid_row = channel_split[channel_split['channel_type'] == 'Paid']
+            org_row  = channel_split[channel_split['channel_type'] == 'Organic/Other']
+            if not paid_row.empty and not org_row.empty:
+                paid_rps = paid_row['RPS'].values[0]
+                org_rps  = org_row['RPS'].values[0]
+                if paid_rps > org_rps:
+                    st.success(f"✅ Paid channels deliver **${paid_rps:.2f}** RPS vs **${org_rps:.2f}** organic — paid traffic is higher quality.")
+                else:
+                    st.warning(f"⚠️ Organic outperforms paid (${org_rps:.2f} vs ${paid_rps:.2f} RPS). Review paid targeting.")
+
     # ── MONTHLY AGGREGATION ────────────────────────────────────────────────────
     monthly = df_year.groupby(['year', 'month', 'month_name']).agg(
         revenue=('total_revenue', 'sum'),
         orders=('total_orders', 'sum'),
         sessions=('total_sessions', 'sum'),
-        new_customers=('new_customers', 'sum') if 'new_customers' in df_year.columns else ('total_orders', 'count'),
-        repeat_customers=('repeat_customers', 'sum') if 'repeat_customers' in df_year.columns else ('total_orders', 'count'),
+        **({'new_customers': ('new_customers', 'sum')} if 'new_customers' in df_year.columns else {'new_customers': ('total_orders', 'count')}),
+        **({'repeat_customers': ('repeat_customers', 'sum')} if 'repeat_customers' in df_year.columns else {'repeat_customers': ('total_orders', 'count')}),
     ).reset_index().sort_values('month')
 
     monthly['aov']         = (monthly['revenue'] / monthly['orders']).fillna(0)
@@ -434,7 +527,6 @@ def page_executive_summary(data, filters):
         st.markdown(f"**Trend:** {rev_trend}")
         st.markdown(f"**Above-avg months:** {', '.join(above_avg_months) if above_avg_months else 'None'}")
 
-        # Narrative insight
         q1_rev = monthly[monthly['month'].isin([1,2,3])]['revenue'].sum()
         q4_rev = monthly[monthly['month'].isin([10,11,12])]['revenue'].sum()
         q4_vs_q1 = calculate_change(q4_rev, q1_rev)
@@ -458,7 +550,6 @@ def page_executive_summary(data, filters):
             st.metric("🆕 New Customers (2025)",    f"{total_new:,}",    f"{total_new/total_cust*100:.1f}%" if total_cust > 0 else "")
             st.metric("🔄 Returning Customers",     f"{total_repeat:,}", f"{total_repeat/total_cust*100:.1f}%" if total_cust > 0 else "")
 
-            # Best new acquisition month
             best_new_month = monthly.loc[monthly['new_customers'].idxmax(), 'month_label'] if 'new_customers' in monthly.columns else "N/A"
             st.info(f"**📅 Best New Acquisition Month:** {best_new_month}")
 
@@ -517,7 +608,6 @@ def page_executive_summary(data, filters):
     lowest_aov_month = monthly.loc[monthly['aov'].idxmin()]
     aov_trend        = trend_label(monthly['aov'])
 
-    # Check discount data for AOV impact
     df_coupon_year = data['coupon_performance'][
         data['coupon_performance']['date'].dt.year == 2025
     ].copy()
@@ -539,16 +629,17 @@ def page_executive_summary(data, filters):
         st.metric("📉 Lowest AOV Month",  lowest_aov_month['month_label'], f"${lowest_aov_month['aov']:.2f}")
         st.markdown(f"**Trend:** {aov_trend}")
 
-        if not df_coupon_year.empty:
+        if not df_coupon_year.empty and 'discount_coupon_code' in df_coupon_year.columns:
             coupon_orders    = df_coupon_year[df_coupon_year['discount_coupon_code'] != 'NO_COUPON']['usage_count'].sum()
             no_coupon_orders = df_coupon_year[df_coupon_year['discount_coupon_code'] == 'NO_COUPON']['usage_count'].sum()
             total_c          = coupon_orders + no_coupon_orders
-            st.info(f"""
-            **💡 Insight**
-            AOV trend is **{aov_trend.split()[1]}**.
-            {coupon_orders/total_c*100:.1f}% of orders used discount coupons.
-            Discounts may be suppressing AOV in high-usage months.
-            """)
+            if total_c > 0:
+                st.info(f"""
+                **💡 Insight**
+                AOV trend is **{aov_trend.split()[1]}**.
+                {coupon_orders/total_c*100:.1f}% of orders used discount coupons.
+                Discounts may be suppressing AOV in high-usage months.
+                """)
 
     # ── MONTHLY SUMMARY TABLE ─────────────────────────────────────────────────
     st.markdown("---")
@@ -594,7 +685,6 @@ def page_conversion_funnel(data, filters):
         st.warning("No funnel data available for selected period")
         return
 
-    # ── YEARLY FUNNEL KPIs ─────────────────────────────────────────────────────
     df_year = add_month_col(df_year)
 
     def funnel_rates(dff):
@@ -642,11 +732,11 @@ def page_conversion_funnel(data, filters):
     with col2:
         st.markdown("**📈 Step Conversion Rates**")
         if total_y > 0:
-            st.metric("Sessions → Product View",  f"{prod_y/total_y*100:.1f}%")
-            st.metric("Product View → Cart",       f"{cart_y/prod_y*100:.1f}%"  if prod_y > 0 else "N/A")
-            st.metric("Cart → Checkout",           f"{check_y/cart_y*100:.1f}%" if cart_y > 0 else "N/A")
-            st.metric("Checkout → Purchase",       f"{purch_y/check_y*100:.1f}%" if check_y > 0 else "N/A")
-            st.metric("Overall (Session→Purchase)",f"{purch_y/total_y*100:.1f}%")
+            st.metric("Sessions → Product View",   f"{prod_y/total_y*100:.1f}%")
+            st.metric("Product View → Cart",        f"{cart_y/prod_y*100:.1f}%"   if prod_y  > 0 else "N/A")
+            st.metric("Cart → Checkout",            f"{check_y/cart_y*100:.1f}%"  if cart_y  > 0 else "N/A")
+            st.metric("Checkout → Purchase",        f"{purch_y/check_y*100:.1f}%" if check_y > 0 else "N/A")
+            st.metric("Overall (Session→Purchase)", f"{purch_y/total_y*100:.1f}%")
 
     # ── MONTHLY FUNNEL BREAKDOWN ───────────────────────────────────────────────
     st.markdown("---")
@@ -659,14 +749,14 @@ def page_conversion_funnel(data, filters):
         purchases      = ('had_order',         'sum'),
     ).reset_index().sort_values('month')
 
-    monthly_funnel['month_label']  = monthly_funnel['month'].apply(get_month_name)
-    monthly_funnel['prod_rate']    = (monthly_funnel['product_views'] / monthly_funnel['sessions'] * 100).round(2)
-    monthly_funnel['cart_rate']    = (monthly_funnel['cart_adds']     / monthly_funnel['sessions'] * 100).round(2)
-    monthly_funnel['conv_rate']    = (monthly_funnel['purchases']     / monthly_funnel['sessions'] * 100).round(2)
-    monthly_funnel['cart_to_purch']= (monthly_funnel['purchases']     / monthly_funnel['cart_adds'] * 100).fillna(0).round(2)
+    monthly_funnel['month_label']   = monthly_funnel['month'].apply(get_month_name)
+    monthly_funnel['prod_rate']     = (monthly_funnel['product_views'] / monthly_funnel['sessions'] * 100).round(2)
+    monthly_funnel['cart_rate']     = (monthly_funnel['cart_adds']     / monthly_funnel['sessions'] * 100).round(2)
+    monthly_funnel['conv_rate']     = (monthly_funnel['purchases']     / monthly_funnel['sessions'] * 100).round(2)
+    monthly_funnel['cart_to_purch'] = (monthly_funnel['purchases']     / monthly_funnel['cart_adds'] * 100).fillna(0).round(2)
 
-    best_month  = monthly_funnel.loc[monthly_funnel['conv_rate'].idxmax()]
-    worst_month = monthly_funnel.loc[monthly_funnel['conv_rate'].idxmin()]
+    best_month   = monthly_funnel.loc[monthly_funnel['conv_rate'].idxmax()]
+    worst_month  = monthly_funnel.loc[monthly_funnel['conv_rate'].idxmin()]
     funnel_trend = trend_label(monthly_funnel['conv_rate'])
 
     col1, col2 = st.columns([2, 1])
@@ -704,47 +794,55 @@ def page_conversion_funnel(data, filters):
 
     col1, col2 = st.columns(2)
     with col1:
-        avg_time_to_cart = df[df['time_to_cart_minutes'].notna()]['time_to_cart_minutes'].mean()
-        st.markdown(f"**⏰ Avg Time to Add to Cart:** `{avg_time_to_cart:.1f}` min")
-        fig = px.histogram(
-            df[df['time_to_cart_minutes'].notna()],
-            x='time_to_cart_minutes', nbins=30,
-            title='Distribution of Time to Cart',
-            labels={'time_to_cart_minutes': 'Minutes'}
-        )
-        fig.update_layout(height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        if 'time_to_cart_minutes' in df.columns:
+            avg_time_to_cart = df[df['time_to_cart_minutes'].notna()]['time_to_cart_minutes'].mean()
+            st.markdown(f"**⏰ Avg Time to Add to Cart:** `{avg_time_to_cart:.1f}` min")
+            fig = px.histogram(
+                df[df['time_to_cart_minutes'].notna()],
+                x='time_to_cart_minutes', nbins=30,
+                title='Distribution of Time to Cart',
+                labels={'time_to_cart_minutes': 'Minutes'}
+            )
+            fig.update_layout(height=300, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("time_to_cart_minutes not available in this dataset.")
+            avg_time_to_cart = 0
 
     with col2:
-        avg_time_to_purchase = df[df['time_to_order_minutes'].notna()]['time_to_order_minutes'].mean()
-        st.markdown(f"**⏰ Avg Time to Purchase:** `{avg_time_to_purchase:.1f}` min")
-        fig = px.histogram(
-            df[df['time_to_order_minutes'].notna()],
-            x='time_to_order_minutes', nbins=30,
-            title='Distribution of Time to Purchase',
-            labels={'time_to_order_minutes': 'Minutes'}
-        )
-        fig.update_layout(height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        if 'time_to_order_minutes' in df.columns:
+            avg_time_to_purchase = df[df['time_to_order_minutes'].notna()]['time_to_order_minutes'].mean()
+            st.markdown(f"**⏰ Avg Time to Purchase:** `{avg_time_to_purchase:.1f}` min")
+            fig = px.histogram(
+                df[df['time_to_order_minutes'].notna()],
+                x='time_to_order_minutes', nbins=30,
+                title='Distribution of Time to Purchase',
+                labels={'time_to_order_minutes': 'Minutes'}
+            )
+            fig.update_layout(height=300, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("time_to_order_minutes not available in this dataset.")
+            avg_time_to_purchase = 0
 
     # Monthly time metric variation
-    st.markdown("---")
-    st.subheader("📅 Monthly Time-to-Purchase Variation")
+    if 'time_to_order_minutes' in df_year.columns:
+        st.markdown("---")
+        st.subheader("📅 Monthly Time-to-Purchase Variation")
 
-    df_year_time = df_year.copy()
-    monthly_time = df_year_time[df_year_time['time_to_order_minutes'].notna()].groupby('month').agg(
-        avg_time_to_order=('time_to_order_minutes', 'mean')
-    ).reset_index()
-    monthly_time['month_label'] = monthly_time['month'].apply(get_month_name)
+        monthly_time = df_year[df_year['time_to_order_minutes'].notna()].groupby('month').agg(
+            avg_time_to_order=('time_to_order_minutes', 'mean')
+        ).reset_index()
+        monthly_time['month_label'] = monthly_time['month'].apply(get_month_name)
 
-    fig = px.bar(
-        monthly_time, x='month_label', y='avg_time_to_order',
-        title='Avg Time to Purchase by Month (minutes)',
-        labels={'avg_time_to_order': 'Minutes', 'month_label': 'Month'},
-        color='avg_time_to_order', color_continuous_scale='RdYlGn_r'
-    )
-    fig.update_layout(height=350, showlegend=False, plot_bgcolor='white')
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.bar(
+            monthly_time, x='month_label', y='avg_time_to_order',
+            title='Avg Time to Purchase by Month (minutes)',
+            labels={'avg_time_to_order': 'Minutes', 'month_label': 'Month'},
+            color='avg_time_to_order', color_continuous_scale='RdYlGn_r'
+        )
+        fig.update_layout(height=350, showlegend=False, plot_bgcolor='white')
+        st.plotly_chart(fig, use_container_width=True)
 
     # ── FUNNEL BY DEVICE TYPE ──────────────────────────────────────────────────
     st.markdown("---")
@@ -792,7 +890,7 @@ def page_conversion_funnel(data, filters):
     st.markdown("---")
     st.subheader("💡 Optimization Recommendations")
 
-    prod_rate_y = prod_y / total_y * 100 if total_y > 0 else 0
+    prod_rate_y     = prod_y / total_y * 100 if total_y > 0 else 0
     cart_to_purch_y = purch_y / cart_y * 100 if cart_y > 0 else 0
 
     col1, col2, col3 = st.columns(3)
@@ -822,13 +920,11 @@ def page_product_performance(data, filters):
     st.markdown('<div class="main-header">📦 Product Performance</div>', unsafe_allow_html=True)
     st.markdown("### Analyze product sales and identify opportunities")
 
-    # Full year product data
     df_year = data['product_performance'][
         data['product_performance']['date'].dt.year == 2025
     ].copy()
     df_year = add_month_col(df_year)
 
-    # Filtered data
     df = data['product_performance'][
         (data['product_performance']['date'] >= filters['start_date']) &
         (data['product_performance']['date'] <= filters['end_date'])
@@ -839,18 +935,14 @@ def page_product_performance(data, filters):
         st.warning("No product data available for selected filters")
         return
 
-
-
-    # Yearly product summary
     yearly_product = df_year.groupby('product_name').agg({
-        'total_revenue':       'sum',
-        'total_quantity_sold': 'sum',
-        'times_purchased':     'sum',
-        'times_added_to_cart': 'sum',
+        'total_revenue':         'sum',
+        'total_quantity_sold':   'sum',
+        'times_purchased':       'sum',
+        'times_added_to_cart':   'sum',
         'cart_to_purchase_rate': 'mean'
     }).reset_index().sort_values('total_revenue', ascending=False)
 
-    # ── YEARLY TOP KPIs ────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📌 2025 Yearly Product KPIs")
     col1, col2, col3, col4 = st.columns(4)
@@ -863,7 +955,6 @@ def page_product_performance(data, filters):
     with col4:
         st.metric("🎯 Avg Cart→Purchase", f"{yearly_product['cart_to_purchase_rate'].mean():.1f}%")
 
-    # ── TOP 10 YEARLY ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🏆 Top 10 Products — 2025 Yearly")
 
@@ -889,10 +980,6 @@ def page_product_performance(data, filters):
         fig.update_layout(height=450, showlegend=False, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
 
-
-    
-
-    
     # ── MONTHLY SALES TREND PER PRODUCT ───────────────────────────────────────
     st.markdown("---")
     st.subheader("📈 Monthly Sales Trend by Product")
@@ -926,7 +1013,6 @@ def page_product_performance(data, filters):
         fig.update_layout(height=400, plot_bgcolor='white')
         st.plotly_chart(fig, use_container_width=True)
 
-    # Peak selling month per product
     st.markdown("---")
     st.subheader("🗓️ Peak Selling Month per Product")
 
@@ -941,7 +1027,6 @@ def page_product_performance(data, filters):
         use_container_width=True
     )
 
-    # ── CART → PURCHASE CONVERSION ─────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🎯 Cart-to-Purchase Conversion by Product")
 
@@ -973,7 +1058,6 @@ def page_product_performance(data, filters):
         fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── DETAILED TABLE ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📋 Detailed Product Performance Table")
 
@@ -987,7 +1071,6 @@ def page_product_performance(data, filters):
         use_container_width=True, height=400
     )
 
-    # ── INSIGHTS ───────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("💡 Product Insights")
 
@@ -1019,7 +1102,6 @@ def page_customer_segmentation(data, filters):
     total_customers = len(df)
     total_ltv       = df['total_revenue'].sum()
 
-    # ── YEARLY SUMMARY KPIs ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📌 2025 Customer KPIs")
     col1, col2, col3, col4 = st.columns(4)
@@ -1032,7 +1114,6 @@ def page_customer_segmentation(data, filters):
     with col4:
         st.metric("🛍️ Avg Orders/Customer",  f"{df['total_orders'].mean():.1f}")
 
-    # ── SEGMENT DISTRIBUTION ──────────────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -1050,7 +1131,6 @@ def page_customer_segmentation(data, filters):
         fig.update_layout(height=450)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Segment % breakdown
         st.markdown("**Segment Breakdown:**")
         for _, row in segment_counts.iterrows():
             st.markdown(f"- **{row['Segment']}**: {row['Count']:,} customers ({row['%']:.1f}%)")
@@ -1075,6 +1155,58 @@ def page_customer_segmentation(data, filters):
         fig.update_layout(height=450, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
+    # ── NEW KPI: REPEAT PURCHASE VELOCITY ─────────────────────────────────────
+    # FIX: Moved inside function body (was at wrong indentation level)
+    st.markdown("---")
+    st.subheader("⏱️ Repeat Purchase Velocity")
+
+    if 'days_between_order_1_and_order_2' in df.columns:
+        velocity = df['days_between_order_1_and_order_2'].dropna()
+
+        st.metric(
+            "Median Days to 2nd Purchase",
+            f"{velocity.median():.0f} days"
+        )
+
+        fig = px.histogram(
+            velocity,
+            nbins=20,
+            title="Days Between First and Second Order",
+            labels={'value': 'Days'}
+        )
+        fig.update_layout(height=300)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.info(
+            "💡 **Insight:** Faster second purchase strongly correlates "
+            "with higher long-term customer value."
+        )
+    else:
+        st.info("days_between_order_1_and_order_2 column not found in user_lifetime data.")
+
+    # ── NEW KPI: REVENUE BY PURCHASE FREQUENCY ────────────────────────────────
+    # FIX: Moved inside function body (was at wrong indentation level)
+    if 'purchase_frequency_bucket' in df.columns:
+        st.markdown("---")
+        st.subheader("🔁 Revenue by Purchase Frequency Bucket")
+        freq_rev = df.groupby('purchase_frequency_bucket')['total_revenue'].sum().reset_index()
+
+        fig = px.bar(
+            freq_rev,
+            x='purchase_frequency_bucket',
+            y='total_revenue',
+            title='Revenue Contribution by Purchase Frequency',
+            labels={'total_revenue': 'Revenue ($)', 'purchase_frequency_bucket': 'Frequency Bucket'},
+            color='total_revenue'
+        )
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.info(
+            "💡 **Insight:** A higher share of revenue from repeat buckets "
+            "indicates sustainable growth."
+        )
+
     # ── MONTHLY REVENUE BY SEGMENT ─────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📅 Monthly Revenue Contribution by Segment")
@@ -1083,56 +1215,7 @@ def page_customer_segmentation(data, filters):
         data['daily_metrics']['date'].dt.year == 2025
     ].copy()
     daily_orders = add_month_col(daily_orders)
-    
-    # ── NEW KPI: REPEAT PURCHASE VELOCITY ─────────────────────────────────────────
-st.markdown("---")
-st.subheader("⏱️ Repeat Purchase Velocity")
 
-if 'days_between_order_1_and_order_2' in df.columns:
-    velocity = df['days_between_order_1_and_order_2'].dropna()
-
-    st.metric(
-        "Median Days to 2nd Purchase",
-        f"{velocity.median():.0f} days"
-    )
-
-    fig = px.histogram(
-        velocity,
-        nbins=20,
-        title="Days Between First and Second Order",
-        labels={'value': 'Days'}
-    )
-    fig.update_layout(height=300)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        "💡 **Insight:** Faster second purchase strongly correlates "
-        "with higher long-term customer value."
-    )
-
-    # ── NEW KPI: REVENUE BY PURCHASE FREQUENCY ────────────────────────────────────
-if 'purchase_frequency_bucket' in df.columns:
-    freq_rev = df.groupby('purchase_frequency_bucket')['total_revenue'].sum().reset_index()
-
-    fig = px.bar(
-        freq_rev,
-        x='purchase_frequency_bucket',
-        y='total_revenue',
-        title='Revenue Contribution by Purchase Frequency',
-        labels={'total_revenue': 'Revenue ($)', 'purchase_frequency_bucket': 'Frequency Bucket'},
-        color='total_revenue'
-    )
-    fig.update_layout(height=350)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        "💡 **Insight:** A higher share of revenue from repeat buckets "
-        "indicates sustainable growth."
-    )
-
-
-    # Approximate segment revenue monthly using RFM user_lifetime + daily revenue
-    # We distribute total monthly revenue proportionally by segment share
     segment_share = segment_revenue.set_index('Segment')['% Revenue'] / 100
 
     monthly_rev = daily_orders.groupby(['month'])['total_revenue'].sum().reset_index()
@@ -1162,13 +1245,14 @@ if 'purchase_frequency_bucket' in df.columns:
     st.markdown("---")
     st.subheader("📊 Segment Performance Details")
 
-    segment_stats = df.groupby('rfm_segment').agg({
-        'user_id':              'count',
-        'total_revenue':        ['sum', 'mean'],
-        'total_orders':         'mean',
-        'avg_order_value':      'mean',
-        'days_since_last_order':'mean'
-    }).reset_index()
+    agg_dict = {
+        'user_id':               'count',
+        'total_revenue':         ['sum', 'mean'],
+        'total_orders':          'mean',
+        'avg_order_value':       'mean',
+        'days_since_last_order': 'mean'
+    }
+    segment_stats = df.groupby('rfm_segment').agg(agg_dict).reset_index()
     segment_stats.columns = ['Segment','Customers','Total Revenue','Avg LTV','Avg Orders','Avg AOV','Avg Days Since Purchase']
     segment_stats = segment_stats.sort_values('Total Revenue', ascending=False)
     segment_stats['% of Customers'] = (segment_stats['Customers'] / total_customers * 100).round(1)
@@ -1207,9 +1291,9 @@ if 'purchase_frequency_bucket' in df.columns:
     with col2:
         st.subheader("📊 RFM Score Distribution")
         rfm_breakdown = pd.DataFrame({
-            'Recency Score':  df['rfm_recency_score'].value_counts().sort_index(),
-            'Frequency Score':df['rfm_frequency_score'].value_counts().sort_index(),
-            'Monetary Score': df['rfm_monetary_score'].value_counts().sort_index()
+            'Recency Score':   df['rfm_recency_score'].value_counts().sort_index(),
+            'Frequency Score': df['rfm_frequency_score'].value_counts().sort_index(),
+            'Monetary Score':  df['rfm_monetary_score'].value_counts().sort_index()
         }).fillna(0).astype(int)
 
         fig = go.Figure()
@@ -1262,14 +1346,14 @@ if 'purchase_frequency_bucket' in df.columns:
     st.subheader("🎯 Recommended Actions by Segment")
 
     recommendations = {
-        'Champion':          ('🏆', 'Best customers — recent, frequent, high-value',   ['Enroll in VIP program', 'Offer early access', 'Request referrals']),
-        'Loyal Customer':    ('💎', 'Regular buyers with consistent patterns',          ['Loyalty rewards', 'Personalized recommendations', 'Subscription options']),
-        'Potential Loyalist':('🌱', 'Recent buyers showing promise',                    ['Nurture email sequences', 'Second-purchase incentive', 'Cross-sell']),
-        'At Risk':           ('⚠️', 'Previously active, haven\'t bought recently',     ['Win-back campaign', 'Survey why they stopped', '"We miss you" discount']),
-        'Lost':              ('😔', 'Inactive for >365 days',                           ['Aggressive re-engagement (20-30%)', 'Last-chance campaign']),
-        'New Customer':      ('🎉', 'First 1-2 purchases',                              ['Welcome email series', 'First repeat purchase incentive', 'Feedback request']),
-        'Needs Attention':   ('🔔', 'Moderate recency and frequency',                  ['Re-engagement email', 'Targeted offer', 'Product recommendations']),
-        'Regular':           ('⭐', 'Consistent moderate buyers',                       ['Upsell to higher tier', 'Loyalty programme enrollment'])
+        'Champion':           ('🏆', 'Best customers — recent, frequent, high-value',  ['Enroll in VIP program', 'Offer early access', 'Request referrals']),
+        'Loyal Customer':     ('💎', 'Regular buyers with consistent patterns',         ['Loyalty rewards', 'Personalized recommendations', 'Subscription options']),
+        'Potential Loyalist': ('🌱', 'Recent buyers showing promise',                   ['Nurture email sequences', 'Second-purchase incentive', 'Cross-sell']),
+        'At Risk':            ('⚠️', "Previously active, haven't bought recently",      ['Win-back campaign', 'Survey why they stopped', '"We miss you" discount']),
+        'Lost':               ('😔', 'Inactive for >365 days',                          ['Aggressive re-engagement (20-30%)', 'Last-chance campaign']),
+        'New Customer':       ('🎉', 'First 1-2 purchases',                             ['Welcome email series', 'First repeat purchase incentive', 'Feedback request']),
+        'Needs Attention':    ('🔔', 'Moderate recency and frequency',                  ['Re-engagement email', 'Targeted offer', 'Product recommendations']),
+        'Regular':            ('⭐', 'Consistent moderate buyers',                      ['Upsell to higher tier', 'Loyalty programme enrollment'])
     }
     for segment, (emoji, desc, actions) in recommendations.items():
         if segment in df['rfm_segment'].values:
@@ -1290,13 +1374,11 @@ def page_marketing_attribution(data, filters):
     st.markdown('<div class="main-header">📣 Marketing Attribution</div>', unsafe_allow_html=True)
     st.markdown("### Measure ROI of marketing channels and campaigns")
 
-    # Full year attribution
     df_year = data['session_attribution'][
         data['session_attribution']['date'].dt.year == 2025
     ].copy()
     df_year = add_month_col(df_year)
 
-    # Filtered
     df = data['session_attribution'][
         (data['session_attribution']['date'] >= filters['start_date']) &
         (data['session_attribution']['date'] <= filters['end_date'])
@@ -1307,7 +1389,6 @@ def page_marketing_attribution(data, filters):
         st.warning("No attribution data available")
         return
 
-    # ── YEARLY CHANNEL PERFORMANCE ─────────────────────────────────────────────
     yearly_source = df_year.groupby('utm_source').agg(
         Sessions    = ('session_id', 'count'),
         Conversions = ('converted',  'sum'),
@@ -1331,31 +1412,33 @@ def page_marketing_attribution(data, filters):
         tot_c = yearly_source['Conversions'].sum()
         st.metric("📈 Overall Conv Rate", f"{tot_c/tot_s*100:.2f}%" if tot_s > 0 else "N/A")
 
-    # ── NEW KPI: REVENUE PER SESSION INDEX ────────────────────────────────────────
+    # ── NEW KPI: REVENUE PER SESSION INDEX ────────────────────────────────────
+    # FIX: Rewrote this section to compute index correctly at channel level
     st.markdown("---")
-    st.subheader("📊 Revenue per Session Index")
+    st.subheader("📊 Revenue per Session Index by Channel")
 
-    source_df = revenue_per_session_index(df)
-
-    index_chart = source_df.groupby('utm_source')['rev_per_session_index'].mean().reset_index()
+    overall_rps = yearly_source['Revenue'].sum() / yearly_source['Sessions'].sum() if yearly_source['Sessions'].sum() > 0 else 1
+    yearly_source['RPS_Index'] = (yearly_source['Revenue per Session'] / overall_rps).round(2)
 
     fig = px.bar(
-        index_chart.sort_values('rev_per_session_index', ascending=False),
-        x='utm_source',
-        y='rev_per_session_index',
-        title='Revenue per Session Index by Channel',
-        labels={'rev_per_session_index': 'Index (1 = Avg)'}
+        yearly_source.sort_values('RPS_Index', ascending=False),
+        x='Source',
+        y='RPS_Index',
+        title='Revenue per Session Index by Channel (1.0 = overall average)',
+        labels={'RPS_Index': 'Index (1 = Avg)', 'Source': 'Channel'},
+        color='RPS_Index',
+        color_continuous_scale='RdYlGn'
     )
-    fig.add_hline(y=1.0, line_dash="dash", line_color="red")
-    fig.update_layout(height=350)
+    fig.add_hline(y=1.0, line_dash="dash", line_color="red",
+                  annotation_text="Average", annotation_position="top right")
+    fig.update_layout(height=380)
     st.plotly_chart(fig, use_container_width=True)
 
     st.info(
         "💡 **Insight:** Channels above index 1.0 bring higher-intent users. "
-        "Optimize budget allocation accordingly."
+        "Prioritise budget toward these channels for maximum revenue efficiency."
     )
 
-    
     # ── CHANNEL REVENUE & CONVERSION ──────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -1381,7 +1464,6 @@ def page_marketing_attribution(data, filters):
         fig.update_layout(height=400, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── TRAFFIC DISTRIBUTION ───────────────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
@@ -1397,7 +1479,6 @@ def page_marketing_attribution(data, filters):
         fig.update_layout(height=380)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── MONTHLY CHANNEL BREAKDOWN ──────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📅 Monthly Channel Performance")
 
@@ -1433,7 +1514,6 @@ def page_marketing_attribution(data, filters):
         fig.update_layout(height=380, plot_bgcolor='white')
         st.plotly_chart(fig, use_container_width=True)
 
-    # Peak month per channel
     st.markdown("---")
     st.subheader("🗓️ Peak Month per Channel")
     peak_channel = monthly_channel.loc[monthly_channel.groupby('utm_source')['Revenue'].idxmax()]
@@ -1446,7 +1526,6 @@ def page_marketing_attribution(data, filters):
         use_container_width=True
     )
 
-    # ── CAMPAIGN PERFORMANCE ───────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📢 Campaign Performance")
 
@@ -1468,7 +1547,6 @@ def page_marketing_attribution(data, filters):
         fig.update_layout(height=450, xaxis_tickangle=-45)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── DETAILED TABLE ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📋 Detailed Channel Performance")
 
@@ -1490,7 +1568,6 @@ def page_marketing_attribution(data, filters):
         use_container_width=True, height=400
     )
 
-    # ── MARKETING INSIGHTS ─────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("💡 Marketing Insights")
 
@@ -1523,13 +1600,11 @@ def page_engagement_ux(data, filters):
     st.markdown('<div class="main-header">📄 Page Engagement & UX</div>', unsafe_allow_html=True)
     st.markdown("### Optimize website content and user experience")
 
-    # Full year
     df_year = data['page_engagement'][
         data['page_engagement']['date'].dt.year == 2025
     ].copy()
     df_year = add_month_col(df_year)
 
-    # Filtered
     df = data['page_engagement'][
         (data['page_engagement']['date'] >= filters['start_date']) &
         (data['page_engagement']['date'] <= filters['end_date'])
@@ -1538,18 +1613,16 @@ def page_engagement_ux(data, filters):
         st.warning("No page engagement data available")
         return
 
-    # Yearly page summary
     yearly_pages = df_year.groupby('path').agg(
-        pageviews         = ('pageviews',       'sum'),
-        unique_users      = ('unique_users',     'sum'),
-        sessions_with_page= ('sessions_with_page','sum'),
-        avg_scroll_depth  = ('avg_scroll_depth', 'mean'),
-        total_clicks      = ('total_clicks',     'sum')
+        pageviews          = ('pageviews',        'sum'),
+        unique_users       = ('unique_users',      'sum'),
+        sessions_with_page = ('sessions_with_page','sum'),
+        avg_scroll_depth   = ('avg_scroll_depth',  'mean'),
+        total_clicks       = ('total_clicks',      'sum')
     ).reset_index()
     yearly_pages['click_per_pageview'] = (yearly_pages['total_clicks'] / yearly_pages['pageviews']).round(2)
     yearly_pages = yearly_pages.sort_values('pageviews', ascending=False)
 
-    # ── YEARLY TOP KPIs ────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📌 2025 Yearly Engagement KPIs")
     col1, col2, col3, col4 = st.columns(4)
@@ -1562,7 +1635,6 @@ def page_engagement_ux(data, filters):
     with col4:
         st.metric("🖱️ Total Clicks",    f"{yearly_pages['total_clicks'].sum():,}")
 
-    # ── TOP PAGES YEARLY ──────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🔝 Top 10 Most Viewed Pages (2025 Yearly)")
 
@@ -1587,7 +1659,6 @@ def page_engagement_ux(data, filters):
         fig.update_layout(height=450, showlegend=False, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── HIGH CTR PAGES (YEARLY) ────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🖱️ Highest CTR Pages (Yearly)")
 
@@ -1601,7 +1672,6 @@ def page_engagement_ux(data, filters):
     fig.update_layout(height=400, showlegend=False, yaxis={'categoryorder': 'total ascending'})
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── SCROLL DEPTH ANALYSIS ──────────────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
@@ -1626,14 +1696,13 @@ def page_engagement_ux(data, filters):
         fig.update_layout(height=380, showlegend=False, yaxis={'categoryorder': 'total descending'})
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── MONTHLY ENGAGEMENT TREND ───────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📅 Monthly Engagement Trends")
 
     monthly_eng = df_year.groupby('month').agg(
-        pageviews       = ('pageviews',       'sum'),
-        avg_scroll      = ('avg_scroll_depth','mean'),
-        total_clicks    = ('total_clicks',    'sum')
+        pageviews    = ('pageviews',       'sum'),
+        avg_scroll   = ('avg_scroll_depth','mean'),
+        total_clicks = ('total_clicks',    'sum')
     ).reset_index()
     monthly_eng['month_label'] = monthly_eng['month'].apply(get_month_name)
 
@@ -1659,38 +1728,40 @@ def page_engagement_ux(data, filters):
         fig.update_layout(height=350, plot_bgcolor='white')
         st.plotly_chart(fig, use_container_width=True)
 
-    # Peak engagement month
     peak_eng_month = monthly_eng.loc[monthly_eng['pageviews'].idxmax()]
     eng_trend      = trend_label(monthly_eng['pageviews'])
     st.info(f"**💡 Engagement Insight:** Peak engagement month: **{peak_eng_month['month_label']}** ({peak_eng_month['pageviews']:,} pageviews). Overall trend: {eng_trend}")
 
+    # ── NEW KPI: REVENUE PER PAGEVIEW ─────────────────────────────────────────
+    # FIX: Moved inside function body (was at module level, wrong indentation).
+    # Also guarded by column check before attempting groupby.
+    if 'revenue' in df_year.columns:
+        st.markdown("---")
+        st.subheader("💰 Revenue per Pageview")
 
-    # ── NEW KPI: REVENUE PER PAGEVIEW ─────────────────────────────────────────────
-st.markdown("---")
-st.subheader("💰 Revenue per Pageview")
+        page_value = df_year.groupby('path').agg(
+            revenue   = ('revenue',   'sum'),
+            pageviews = ('pageviews', 'sum')
+        ).reset_index()
+        page_value['revenue_per_pageview'] = page_value['revenue'] / page_value['pageviews'].replace(0, np.nan)
+        page_value = page_value.dropna(subset=['revenue_per_pageview']).sort_values('revenue_per_pageview', ascending=False).head(10)
 
-if 'revenue' in df_year.columns:
-    page_value = df_year.groupby('path').agg(
-        revenue=('revenue', 'sum'),
-        pageviews=('pageviews', 'sum')
-    ).reset_index()
+        fig = px.bar(
+            page_value,
+            y='path',
+            x='revenue_per_pageview',
+            orientation='h',
+            title='Top 10 Pages by Revenue per Pageview',
+            labels={'revenue_per_pageview': 'Revenue per Pageview ($)', 'path': 'Page'},
+            color='revenue_per_pageview', color_continuous_scale='Purples'
+        )
+        fig.update_layout(height=380, showlegend=False, yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
 
-    page_value['revenue_per_pageview'] = page_value['revenue'] / page_value['pageviews']
-    page_value = page_value.sort_values('revenue_per_pageview', ascending=False).head(10)
-
-    fig = px.bar(
-        page_value,
-        x='path',
-        y='revenue_per_pageview',
-        title='Top Pages by Revenue per Pageview'
-    )
-    fig.update_layout(height=350)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        "💡 **Insight:** These pages generate disproportionate value "
-        "despite traffic volume."
-    )
+        st.info(
+            "💡 **Insight:** These pages generate disproportionate revenue relative to "
+            "their traffic. Invest in driving more visitors to these high-value pages."
+        )
 
     # ── PAGE TYPE ANALYSIS ─────────────────────────────────────────────────────
     st.markdown("---")
@@ -1709,9 +1780,9 @@ if 'revenue' in df_year.columns:
 
     yearly_pages['page_type'] = yearly_pages['path'].apply(categorize_page)
     type_summary = yearly_pages.groupby('page_type').agg(
-        pageviews       = ('pageviews',       'sum'),
-        avg_scroll_depth= ('avg_scroll_depth','mean'),
-        click_per_pv    = ('click_per_pageview','mean')
+        pageviews        = ('pageviews',          'sum'),
+        avg_scroll_depth = ('avg_scroll_depth',    'mean'),
+        click_per_pv     = ('click_per_pageview',  'mean')
     ).reset_index().sort_values('pageviews', ascending=False)
 
     col1, col2 = st.columns(2)
@@ -1726,16 +1797,15 @@ if 'revenue' in df_year.columns:
         fig.update_layout(height=350, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── DETAILED TABLE ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📋 Detailed Page Performance")
 
     page_summary = df.groupby('path').agg(
-        pageviews         = ('pageviews',       'sum'),
-        unique_users      = ('unique_users',     'sum'),
-        sessions_with_page= ('sessions_with_page','sum'),
-        avg_scroll_depth  = ('avg_scroll_depth', 'mean'),
-        total_clicks      = ('total_clicks',     'sum')
+        pageviews          = ('pageviews',        'sum'),
+        unique_users       = ('unique_users',      'sum'),
+        sessions_with_page = ('sessions_with_page','sum'),
+        avg_scroll_depth   = ('avg_scroll_depth',  'mean'),
+        total_clicks       = ('total_clicks',      'sum')
     ).reset_index()
     page_summary['click_per_pageview'] = (page_summary['total_clicks'] / page_summary['pageviews']).round(2)
     page_summary = page_summary.sort_values('pageviews', ascending=False)
@@ -1749,7 +1819,6 @@ if 'revenue' in df_year.columns:
         use_container_width=True, height=400
     )
 
-    # ── UX RECOMMENDATIONS ─────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("💡 UX Optimization Recommendations")
 
@@ -1761,6 +1830,8 @@ if 'revenue' in df_year.columns:
         low_ctr_pages = page_summary[(page_summary['pageviews'] >= page_summary['pageviews'].median()) & (page_summary['click_per_pageview'] < 1)]
         if not low_ctr_pages.empty:
             st.warning(f"**🖱️ Low Click-Through**\n\n{len(low_ctr_pages)} popular pages with <1 click/view\n\n- Weak CTAs\n\n**Action:** Add prominent CTAs")
+        else:
+            st.success("**🖱️ CTAs Working Well**\n\nNo high-traffic pages with critically low click-through rates.")
     with col3:
         best_type = type_summary.iloc[0]
         st.success(f"**✅ Top Page Type**\n\n**{best_type['page_type']}**\n- Views: {best_type['pageviews']:,.0f}\n- Scroll: {best_type['avg_scroll_depth']:.1f}%")
@@ -1775,13 +1846,11 @@ def page_promotions(data, filters):
     st.markdown('<div class="main-header">💰 Discount & Promotion Analysis</div>', unsafe_allow_html=True)
     st.markdown("### Measure effectiveness of promotional campaigns")
 
-    # Full year coupon data
     df_year = data['coupon_performance'][
         data['coupon_performance']['date'].dt.year == 2025
     ].copy()
     df_year = add_month_col(df_year)
 
-    # Filtered
     df = data['coupon_performance'][
         (data['coupon_performance']['date'] >= filters['start_date']) &
         (data['coupon_performance']['date'] <= filters['end_date'])
@@ -1800,7 +1869,6 @@ def page_promotions(data, filters):
     orders_with_coupon     = with_coupon['usage_count'].sum()
     orders_without_coupon  = without_coupon['usage_count'].sum()
 
-    # ── YEARLY KPIs ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 📌 2025 Yearly Discount KPIs")
     col1, col2, col3, col4 = st.columns(4)
@@ -1816,20 +1884,18 @@ def page_promotions(data, filters):
         aov_without = revenue_without_coupon / orders_without_coupon if orders_without_coupon > 0 else 0
         st.metric("💳 AOV (no coupon)",      f"${aov_without:.2f}")
 
-    # AOV impact message
     aov_diff = calculate_change(aov_with, aov_without)
     if aov_with > aov_without:
         st.success(f"✅ Coupons **increase** AOV by {aov_diff:.1f}% — customers buy more with discounts!")
     else:
         st.warning(f"⚠️ Coupons **decrease** AOV by {abs(aov_diff):.1f}% — customers may only buy cheap items with discounts")
 
-    # ── YEARLY COUPON vs NO COUPON ─────────────────────────────────────────────
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("📊 Revenue Distribution (Yearly)")
         rev_comp = pd.DataFrame({
-            'Type': ['With Coupon', 'Without Coupon'],
+            'Type':    ['With Coupon', 'Without Coupon'],
             'Revenue': [revenue_with_coupon, revenue_without_coupon],
             'Orders':  [orders_with_coupon,  orders_without_coupon]
         })
@@ -1847,7 +1913,6 @@ def page_promotions(data, filters):
         fig.update_layout(height=380)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── MONTHLY DISCOUNT USAGE ─────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📅 Monthly Discount Patterns")
 
@@ -1857,11 +1922,11 @@ def page_promotions(data, filters):
         gross_revenue  = ('gross_revenue',         'sum'),
         usage_count    = ('usage_count',            'sum')
     ).reset_index()
-    monthly_discount['month_label']    = monthly_discount['month'].apply(get_month_name)
-    monthly_discount['discount_rate']  = (monthly_discount['discount_given'] / monthly_discount['gross_revenue'] * 100).round(2)
+    monthly_discount['month_label']   = monthly_discount['month'].apply(get_month_name)
+    monthly_discount['discount_rate'] = (monthly_discount['discount_given'] / monthly_discount['gross_revenue'] * 100).round(2)
 
-    peak_disc_month  = monthly_discount.loc[monthly_discount['usage_count'].idxmax()]
-    disc_trend       = trend_label(monthly_discount['usage_count'])
+    peak_disc_month = monthly_discount.loc[monthly_discount['usage_count'].idxmax()]
+    disc_trend      = trend_label(monthly_discount['usage_count'])
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1886,7 +1951,6 @@ def page_promotions(data, filters):
 
     st.info(f"**💡 Seasonal Pattern:** Coupon usage is **{disc_trend.split()[1]}**. Peak month: **{peak_disc_month['month_label']}** ({peak_disc_month['usage_count']:,} uses). High-usage months may reflect seasonal/festive promotions.")
 
-    # ── MONTHLY DISCOUNT IMPACT ON CONVERSION ──────────────────────────────────
     st.markdown("---")
     st.subheader("📈 Monthly Discount Impact on Revenue")
 
@@ -1905,16 +1969,15 @@ def page_promotions(data, filters):
     fig.update_layout(title="Monthly Revenue vs Discount Given", height=400, hovermode='x unified')
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── TOP COUPONS ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🏆 Most Popular Coupons")
 
     coupon_summary = with_coupon.groupby('discount_coupon_code').agg(
-        usage_count          = ('usage_count',        'sum'),
-        total_discount_given = ('total_discount_given','sum'),
-        gross_revenue        = ('gross_revenue',       'sum'),
-        avg_order_value      = ('avg_order_value',     'mean'),
-        discount_percentage  = ('discount_percentage', 'mean')
+        usage_count          = ('usage_count',         'sum'),
+        total_discount_given = ('total_discount_given', 'sum'),
+        gross_revenue        = ('gross_revenue',        'sum'),
+        avg_order_value      = ('avg_order_value',      'mean'),
+        discount_percentage  = ('discount_percentage',  'mean')
     ).reset_index()
     coupon_summary = coupon_summary.rename(columns={'gross_revenue': 'total_revenue'})
     coupon_summary = coupon_summary.sort_values('usage_count', ascending=False).head(15)
@@ -1940,7 +2003,6 @@ def page_promotions(data, filters):
         fig.update_layout(height=500, showlegend=False, yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── DISCOUNT DEPTH ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📉 Discount Depth Analysis")
 
@@ -1974,7 +2036,6 @@ def page_promotions(data, filters):
         fig.update_layout(height=380, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── DETAILED TABLE ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📋 Detailed Coupon Performance")
 
@@ -1987,7 +2048,6 @@ def page_promotions(data, filters):
         use_container_width=True, height=400
     )
 
-    # ── INSIGHTS ───────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("💡 Promotion Insights & Recommendations")
 
