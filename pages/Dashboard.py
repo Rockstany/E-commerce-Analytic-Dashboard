@@ -354,6 +354,7 @@ coupon_df = data['coupon_performance'][
     data['coupon_performance']['date'].dt.year == 2025
 ]
 
+
 if 'gross_order_value_before_discount' in coupon_df.columns:
     efficiency = discount_efficiency_ratio(coupon_df)
     if efficiency:
