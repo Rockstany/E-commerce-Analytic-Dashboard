@@ -347,28 +347,42 @@ def page_executive_summary(data, filters):
         st.metric("💵 Avg Order Value", f"${yearly_aov:.2f}")
 
     # ── NEW KPI: DISCOUNT EFFICIENCY ──────────────────────────────────────────────
-st.markdown("---")
-st.subheader("💸 Pricing & Discount Health")
 
-coupon_df = data['coupon_performance'][
-    data['coupon_performance']['date'].dt.year == 2025
-]
+    # ── NEW KPI: DISCOUNT EFFICIENCY ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("💸 Pricing & Discount Health")
 
+    coupon_df = coupon_performance_df[
+        coupon_performance_df['date'].dt.year == selected_year
+    ]
 
-if 'gross_order_value_before_discount' in coupon_df.columns:
-    efficiency = discount_efficiency_ratio(coupon_df)
-    if efficiency:
+    if (
+        'gross_order_value_before_discount' in coupon_df.columns
+        and 'total_revenue' in coupon_df.columns
+        ):
+        gross = coupon_df['gross_order_value_before_discount'].sum()
+        net = coupon_df['total_revenue'].sum()
+
+    if gross > 0:
+        efficiency = net / gross
+
         st.metric(
             "Discount Efficiency Ratio",
             f"{efficiency*100:.1f}%",
             help="Net Revenue ÷ Gross Order Value before discount"
         )
+
         st.info(
             "💡 **Insight:** "
-            + ("Healthy pricing power." if efficiency > 0.9 else
-               "Revenue growth is discount-driven. Monitor margins.")
+            + (
+                "Healthy pricing power."
+                if efficiency > 0.9
+                else "Revenue growth is discount-driven. Monitor margins."
+            )
         )
 
+    
+    
     # ── MONTHLY AGGREGATION ────────────────────────────────────────────────────
     monthly = df_year.groupby(['year', 'month', 'month_name']).agg(
         revenue=('total_revenue', 'sum'),
