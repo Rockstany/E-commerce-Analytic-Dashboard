@@ -890,47 +890,8 @@ def page_product_performance(data, filters):
         st.plotly_chart(fig, use_container_width=True)
 
 
-    # ── NEW KPI: CART ABANDONMENT HOTSPOTS ─────────────────────────────────────────
-    # ── NEW KPI: CART ABANDONMENT HOTSPOTS ─────────────────────────────────────────
-st.markdown("---")
-st.subheader("🚨 Cart Abandonment Hotspots")
-
-df_prod = None
-
-# Detect existing product dataframe safely
-for var in [
-    'product_performance',
-    'product_performance_df',
-    'product_daily_df',
-    'df_product'
-]:
-    if var in globals():
-        df_prod = globals()[var]
-        break
-
-if df_prod is not None and 'cart_abandonment_rate' in df_prod.columns:
-    hotspot = df_prod[
-        ['product_name', 'cart_abandonment_rate', 'total_revenue']
-    ].dropna()
-
-    fig = px.scatter(
-        hotspot,
-        x='cart_abandonment_rate',
-        y='total_revenue',
-        size='total_revenue',
-        text='product_name',
-        title='High Revenue vs Cart Abandonment'
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        "💡 **Insight:** High-revenue products with high abandonment "
-        "are ideal candidates for UX or pricing fixes."
-    )
-
     
-    
+
     
     # ── MONTHLY SALES TREND PER PRODUCT ───────────────────────────────────────
     st.markdown("---")
